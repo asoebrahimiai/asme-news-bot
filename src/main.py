@@ -8,8 +8,9 @@ from appwrite.query import Query
 from datetime import datetime, timezone
 import time
 
-# کتابخانه برای استخراج هوشمند محتوا
+# کتابخانه‌های استخراج محتوا و هوش مصنوعی
 from newspaper import Article, Config
+import google.generativeai as genai
 
 # ─── تنظیمات محیطی ────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
@@ -19,12 +20,15 @@ APPWRITE_PROJECT_ID = os.environ.get("APPWRITE_PROJECT_ID", "")
 APPWRITE_API_KEY    = os.environ.get("APPWRITE_API_KEY", "")
 DATABASE_ID   = os.environ.get("APPWRITE_DATABASE_ID", "")
 COLLECTION_ID = os.environ.get("APPWRITE_COLLECTION_ID", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "") # کلید هوش مصنوعی
+
+# پیکربندی Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')
 
 HEADLINES_URL = "https://www.asme.org/about-asme/media-inquiries/asme-in-the-headlines"
-
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 # ─── Appwrite ───────────────────────────────────
@@ -87,90 +91,78 @@ def fetch_headlines() -> list:
                         break
 
             news_list.append({"url": href, "title": title, "source": source})
-
         return news_list[:5]
     except Exception as e:
         print(f"Fetch error: {e}")
         return []
 
-# ─── استخراج هوشمند چکیده (اصلاح شده) ───────────────
-def extract_article_summary(url: str) -> str:
+# ─── استخراج متن و پردازش با Gemini ───────────────────────────
+def get_ai_summary(url: str, title_en: str):
+    """استخراج متن و تولید چکیده و ترجمه عنوان توسط هوش مصنوعی"""
     try:
         config = Config()
         config.browser_user_agent = HEADERS["User-Agent"]
-        config.request_timeout = 15
-        
         article = Article(url, config=config)
         article.download()
         article.parse()
-
-        # استخراج پاراگراف‌هایی که واقعاً متن خبری هستند
-        paragraphs = [p.strip() for p in article.text.split('\n') if len(p.strip()) > 100]
         
-        # ترکیب دو پاراگراف اول برای ایجاد یک چکیده جامع
-        raw_summary = " ".join(paragraphs[:2])
-        return raw_summary[:700] # محدودیت برای جلوگیری از خطای ترجمه
+        full_text = article.text
+        if len(full_text) < 200:
+            return None, None
+
+        # طراحی دستور (Prompt) برای هوش مصنوعی
+        prompt = f"""
+        You are a professional engineering news editor. Based on the following news article, please provide:
+        1. A formal Persian translation of the Title.
+        2. A concise one-paragraph summary of the news in Persian (max 100 words).
+        
+        Article Title: {title_en}
+        Article Content: {full_text[:3000]}
+        
+        Format your response exactly like this:
+        TITLE: [Persian Title]
+        SUMMARY: [Persian Summary]
+        """
+        
+        response = model.generate_content(prompt)
+        output = response.text
+        
+        # تجزیه پاسخ AI
+        title_fa = output.split("TITLE:")[1].split("SUMMARY:")[0].strip()
+        summary_fa = output.split("SUMMARY:")[1].strip()
+        
+        return title_fa, summary_fa
     except Exception as e:
-        print(f"Summary extraction error: {e}")
-        return ""
+        print(f"AI Error: {e}")
+        return None, None
 
-# ─── ترجمه ایمن (بدون محدودیت طول) ───────────────────────────
-def translate_to_persian(text: str) -> str:
-    if not text or len(text) < 5:
-        return ""
-    try:
-        # تقسیم متن به تکه‌های ۴۰۰ کاراکتری برای جلوگیری از Query Limit
-        chunks = [text[i:i+400] for i in range(0, len(text), 400)]
-        translated_parts = []
-
-        for chunk in chunks:
-            api_url = "https://api.mymemory.translated.net/get"
-            params = {"q": chunk, "langpair": "en|fa"}
-            resp = requests.get(api_url, params=params, timeout=15)
-            if resp.status_code == 200:
-                translated_parts.append(resp.json().get("responseData", {}).get("translatedText", ""))
-            time.sleep(0.5)
-
-        return " ".join(translated_parts)
-    except Exception:
-        return ""
-
-# ─── ارسال به تلگرام (قالب‌بندی جدید) ───────────────────────────
+# ─── ارسال به تلگرام ───────────────────────────────────────────
 def send_telegram(title_fa: str, summary_fa: str, source: str, news_url: str) -> bool:
-    # ساختار پیام با چکیده در یک پاراگراف
-    message = f"📰 **{title_fa.strip()}**\n\n"
-    
-    if summary_fa:
-        message += f"🔹 **چکیده خبر:**\n{summary_fa.strip()}\n\n"
-
+    message = f"📰 **{title_fa}**\n\n"
+    message += f"🔹 **چکیده خبر:**\n{summary_fa}\n\n"
     if source:
         message += f"🌐 **منبع:** {source}\n"
-
     message += f"🔗 [مشاهده خبر کامل]({news_url})\n"
     message += "───\n"
-    message += "_via ASME In the Headlines_"
+    message += "🆔 @ASME_Persian_News"
 
     api_base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
     try:
-        r = requests.post(
-            f"{api_base}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHANNEL,
-                "text": message,
-                "parse_mode": "Markdown",
-                "disable_web_page_preview": False
-            },
-            timeout=15
-        )
+        r = requests.post(f"{api_base}/sendMessage", json={
+            "chat_id": TELEGRAM_CHANNEL,
+            "text": message,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": False
+        }, timeout=15)
         return r.status_code == 200
     except Exception:
         return False
 
 # ─── تابع اصلی ──────────────────────────────────────
 def main(context):
-    print("=== ASME Bot Execution Started ===")
+    print("=== ASME Smart Bot Started ===")
     
-    if not all([TELEGRAM_TOKEN, TELEGRAM_CHANNEL, APPWRITE_PROJECT_ID, APPWRITE_API_KEY]):
+    if not all([TELEGRAM_TOKEN, TELEGRAM_CHANNEL, GEMINI_API_KEY]):
         return context.res.json({"error": "Config missing"}, status_code=500)
 
     databases = get_db()
@@ -181,19 +173,15 @@ def main(context):
         if is_published(databases, news["url"]):
             continue
 
-        print(f"Processing: {news['title']}")
+        print(f"Processing with AI: {news['title']}")
         
-        # ۱. استخراج و ترجمه عنوان
-        title_fa = translate_to_persian(news["title"])
-        
-        # ۲. استخراج و ترجمه چکیده
-        en_summary = extract_article_summary(news["url"])
-        summary_fa = translate_to_persian(en_summary)
+        # استفاده از هوش مصنوعی برای تولید محتوا
+        title_fa, summary_fa = get_ai_summary(news["url"], news["title"])
 
-        # ۳. ارسال
-        if send_telegram(title_fa, summary_fa, news["source"], news["url"]):
-            save_to_db(databases, news["url"], news["title"])
-            new_count += 1
-            time.sleep(3)
+        if title_fa and summary_fa:
+            if send_telegram(title_fa, summary_fa, news["source"], news["url"]):
+                save_to_db(databases, news["url"], news["title"])
+                new_count += 1
+                time.sleep(4) # وقفه برای جلوگیری از اسپم
 
     return context.res.json({"published": new_count})
