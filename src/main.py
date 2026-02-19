@@ -18,7 +18,7 @@ APPWRITE_PROJECT_ID = os.environ.get("APPWRITE_PROJECT_ID", "")
 APPWRITE_API_KEY    = os.environ.get("APPWRITE_API_KEY", "")
 DATABASE_ID       = os.environ.get("APPWRITE_DATABASE_ID", "")
 COLLECTION_ID     = os.environ.get("APPWRITE_COLLECTION_ID", "")
-GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "") # کلید API جدید
+GEMINI_API_KEY    = os.environ.get("GEMINI_API_KEY", "")
 
 HEADLINES_URL = "https://www.asme.org/about-asme/media-inquiries/asme-in-the-headlines"
 
@@ -63,7 +63,6 @@ def save_to_db(databases, url: str, title: str):
 
 # ─── News Fetching and Parsing (REVISED & ROBUST) ───────────────────────────
 def fetch_headlines() -> list:
-    """لیست عناوین و منابع اخبار را با دقت بالا استخراج می‌کند"""
     print("Fetching headlines from ASME...")
     try:
         resp = requests.get(HEADLINES_URL, headers=HEADERS, timeout=20)
@@ -75,8 +74,11 @@ def fetch_headlines() -> list:
     soup = BeautifulSoup(resp.content, "html.parser")
     news_list = []
     
-    content_area = soup.find('div', class_='sf_colsIn') or soup.body
-    
+    # Find the main content area to avoid grabbing irrelevant links
+    content_area = soup.find('div', class_='sf_colsIn')
+    if not content_area:
+        content_area = soup.body
+
     for a_tag in content_area.find_all("a", href=True):
         href = a_tag["href"].strip()
         title = a_tag.get_text(strip=True)
@@ -87,24 +89,22 @@ def fetch_headlines() -> list:
         source = ""
         parent_p = a_tag.find_parent('p')
         if parent_p:
-            # حذف عنوان و تاریخ و موارد اضافه برای استخراج دقیق منبع
             source_text = parent_p.get_text(" ", strip=True).replace(title, "").strip()
+            # Clean up the source string by removing date/separator junk
             source_text = source_text.split("–")[0].split("-")[0].strip()
-            # منبع نباید بیش از حد طولانی باشد
-            if 2 < len(source_text) < 80:
+            if 2 < len(source_text) < 80: # A reasonable length for a source name
                 source = source_text
 
         if not any(d['url'] == href for d in news_list):
-            news_list.append({"url": href, "title": title, "source": source.strip()})
-            print(f"  Found: {title[:60]} | Source: {source}")
+            news_list.append({"url": href, "title": title, "source": source})
+            print(f"  Found: {title[:60]} | Source: [{source}]")
 
     print(f"Total unique headlines found: {len(news_list)}")
-    return news_list[:5] # پردازش ۵ خبر جدید
+    return news_list[:5] # Limit to 5 for processing
 
 # ─── Article Extraction (using Newspaper3k) ──────────────────────────────────
 def extract_article_text(url: str) -> str:
-    """متن اصلی مقاله را با استفاده از کتابخانه newspaper3k استخراج می‌کند"""
-    print(f"Extracting text from: {url[:60]}")
+    print(f"Extracting text from: {url[:70]}")
     try:
         config = Config()
         config.browser_user_agent = HEADERS['User-Agent']
@@ -121,7 +121,6 @@ def extract_article_text(url: str) -> str:
 
 # ─── AI Summarization & Translation (using Gemini) ───────────────────────────
 def summarize_and_translate_with_gemini(title: str, article_text: str) -> tuple[str, str]:
-    """متن را با Gemini خلاصه و به فارسی ترجمه می‌کند"""
     if not GEMINI_API_KEY:
         return title, "خطا: کلید API برای Gemini تنظیم نشده است."
     
@@ -149,7 +148,6 @@ def summarize_and_translate_with_gemini(title: str, article_text: str) -> tuple[
             model = genai.GenerativeModel(model_name)
             response = model.generate_content(prompt)
             
-            # Parsing the response
             text = response.text
             title_fa = text.split("TITLE_FA:")[1].split("SUMMARY_FA:")[0].strip()
             summary_fa = text.split("SUMMARY_FA:")[1].strip()
@@ -157,17 +155,16 @@ def summarize_and_translate_with_gemini(title: str, article_text: str) -> tuple[
             if title_fa and summary_fa:
                 return title_fa, summary_fa
             else:
-                # اگر پاسخ فرمت مورد انتظار را نداشت
                 raise ValueError("Invalid response format from Gemini")
 
         except Exception as e:
             print(f"Error with model {model_name}: {e}")
             if "API version v1beta" in str(e) or "is not found" in str(e):
-                print("This model may not be available. Trying the next one.")
-                continue # رفتن به مدل بعدی
-            return title, f"خطا در پردازش متن با هوش مصنوعی: {str(e)[:100]}"
+                print("This model seems unavailable. Trying the next one.")
+                continue
+            return title, f"خطا در پردازش با مدل {model_name}: {str(e)[:100]}"
             
-    return title, "خطا: هیچکدام از مدل‌های هوش مصنوعی در دسترس نبودند."
+    return title, "خطا: هیچکدام از مدل‌های هوش مصنوعی در دسترس نبودند. لطفاً نسخه کتابخانه google-generativeai را در requirements.txt بررسی کنید."
 
 
 # ─── Telegram Bot Functions ──────────────────────────────────────────────────
@@ -204,6 +201,8 @@ def send_telegram(title_fa: str, summary_fa: str, source: str, news_url: str) ->
 
 # ─── Main Execution Logic ────────────────────────────────────────────────────
 def main(context):
+    # <<<--- پیام دیباگ برای اطمینان از اجرای کد جدید ---<<<
+    print("✅✅✅ RUNNING LATEST CODE VERSION v3.0 ✅✅✅")
     print("===================================")
     print(f"ASME Bot Execution Started at {datetime.now(timezone.utc)}")
     print("===================================")
@@ -230,40 +229,39 @@ def main(context):
                 continue
 
             print(f"\n--- Processing: {news['title'][:70]} ---")
-
             article_text = extract_article_text(news["url"])
-            
             if not article_text:
                 print("  -> Could not extract article text. Skipping.")
-                log.append(f"FAIL (extract): {news['title'][:40]}")
+                log.append(f"FAIL extract: {news['title'][:40]}")
                 continue
-
-            print(f"  -> Extracted text length: {len(article_text)}")
             
+            # Use Gemini for translation and summarization
             title_fa, summary_fa = summarize_and_translate_with_gemini(news["title"], article_text)
             
-            print(f"  -> Translated Title: {title_fa[:60]}")
-            print(f"  -> Summary Length: {len(summary_fa)}")
-
+            print(f"  -> Gemini Title: {title_fa[:60]}")
+            print(f"  -> Gemini Summary (len): {len(summary_fa)}")
+            
+            # Send to Telegram
             ok = send_telegram(title_fa, summary_fa, news["source"], news["url"])
 
             if ok:
                 save_to_db(databases, news["url"], news["title"])
                 new_count += 1
                 log.append(f"OK: {news['title'][:50]}")
-                print(f"  -> Successfully published to Telegram and saved to DB.")
-                time.sleep(2) # فاصله بین درخواست‌ها
+                time.sleep(2)  # Avoid rate limiting
             else:
-                log.append(f"FAIL (telegram): {news['title'][:40]}")
-                print("  -> Failed to send message to Telegram.")
+                log.append(f"FAIL telegram: {news['title'][:40]}")
+                time.sleep(5)
 
         except Exception as e:
-            print(f"An unexpected error occurred in the main loop: {e}")
-            log.append(f"ERROR: {str(e)[:60]}")
-
+            error_details = f"Unexpected error while processing '{news.get('title', 'N/A')}': {e}"
+            print(error_details)
+            log.append(error_details)
+            
     print("\n===================================")
-    print(f"Execution Finished. Published: {new_count}/{len(news_list)}")
+    print(f"ASME Bot Execution Finished. Published: {new_count}/{len(news_list)}")
     print("===================================")
+    
     return context.res.json({
         "published": new_count,
         "total_found": len(news_list),
