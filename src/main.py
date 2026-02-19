@@ -24,7 +24,6 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
 }
 
-# ─── Appwrite Client ───────────────────────────────────────────
 def get_db():
     client = Client()
     client.set_endpoint(APPWRITE_ENDPOINT)
@@ -32,7 +31,6 @@ def get_db():
     client.set_key(APPWRITE_API_KEY)
     return Databases(client)
 
-# ─── بررسی انتشار قبلی ─────────────────────────────────────────
 def is_published(databases, url: str) -> bool:
     try:
         res = databases.list_documents(
@@ -45,7 +43,6 @@ def is_published(databases, url: str) -> bool:
         print(f"DB check error: {e}")
         return False
 
-# ─── ذخیره در دیتابیس ──────────────────────────────────────────
 def save_to_db(databases, url: str, title: str):
     try:
         databases.create_document(
@@ -61,12 +58,10 @@ def save_to_db(databases, url: str, title: str):
     except Exception as e:
         print(f"DB save error: {e}")
 
-# ─── دریافت اخبار ──────────────────────────────────────────────
 def fetch_headlines() -> list:
-    print(f"Fetching headlines...")
+    print("Fetching headlines...")
     try:
         resp = requests.get(HEADLINES_URL, headers=HEADERS, timeout=20)
-        print(f"Status: {resp.status_code}, Size: {len(resp.content)} bytes")
         resp.raise_for_status()
     except Exception as e:
         print(f"Fetch error: {e}")
@@ -99,27 +94,26 @@ def fetch_headlines() -> list:
         print(f"  Found: {title[:60]}")
 
     print(f"Total found: {len(news_list)}")
-    # فقط ۵ خبر اول برای جلوگیری از timeout
     return news_list[:5]
 
-# ─── ترجمه ─────────────────────────────────────────────────────
 def translate_to_persian(text: str) -> str:
+    """ترجمه با MyMemory API - رایگان و بدون API Key"""
     try:
-        resp = requests.post(
-            "https://libretranslate.com/translate",
-            json={"q": text, "source": "en", "target": "fa", "format": "text"},
-            headers={"Content-Type": "application/json"},
+        resp = requests.get(
+            "https://api.mymemory.translated.net/get",
+            params={"q": text[:500], "langpair": "en|fa"},
             timeout=10
         )
         if resp.status_code == 200:
-            result = resp.json().get("translatedText", "")
-            if result:
+            data = resp.json()
+            result = data.get("responseData", {}).get("translatedText", "")
+            if result and result != text:
+                print(f"  Translated: {result[:60]}")
                 return result
     except Exception as e:
         print(f"Translation error: {e}")
     return text
 
-# ─── ارسال به تلگرام ───────────────────────────────────────────
 def send_telegram(title_fa: str, source: str, news_url: str) -> bool:
     caption = (
         f"📰 *{title_fa}*\n\n"
@@ -142,18 +136,14 @@ def send_telegram(title_fa: str, source: str, news_url: str) -> bool:
             },
             timeout=15
         )
-        print(f"Telegram: {r.status_code} - {r.text[:100]}")
+        print(f"Telegram: {r.status_code}")
         return r.status_code == 200
     except Exception as e:
         print(f"Telegram error: {e}")
         return False
 
-# ─── تابع اصلی ─────────────────────────────────────────────────
 def main(context):
     print("=== ASME Bot Starting ===")
-    print(f"TOKEN set: {bool(TELEGRAM_TOKEN)}")
-    print(f"CHANNEL: {TELEGRAM_CHANNEL}")
-    print(f"DB: {DATABASE_ID} | COL: {COLLECTION_ID}")
 
     if not TELEGRAM_TOKEN:
         return context.res.json({"error": "TELEGRAM_TOKEN not set"})
@@ -175,7 +165,6 @@ def main(context):
                 print(f"Skip: {news['url'][:50]}")
                 continue
 
-            print(f"Processing: {news['title'][:60]}")
             title_fa = translate_to_persian(news["title"])
             ok = send_telegram(title_fa, news["source"], news["url"])
 
@@ -183,7 +172,7 @@ def main(context):
                 save_to_db(databases, news["url"], news["title"])
                 new_count += 1
                 log.append(f"OK: {news['title'][:50]}")
-                time.sleep(2)
+                time.sleep(1)
             else:
                 log.append(f"FAIL: {news['title'][:40]}")
 
