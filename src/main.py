@@ -28,7 +28,7 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-MAX_NEWS = 5  # حداکثر تعداد اخبار در هر اجرا
+MAX_NEWS = 8  # حداکثر تعداد اخبار در هر اجرا
 
 
 # ─── اسکرپ لینک‌های خبری از صفحه ASME ───────────────────────
