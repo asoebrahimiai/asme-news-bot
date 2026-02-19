@@ -11,6 +11,7 @@ import time
 # کتابخانه جدید برای استخراج هوشمند محتوا
 from newspaper import Article, Config
 
+# ─── خواندن متغیرهای محیطی ────────────────────────────────────────
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHANNEL = os.environ.get("TELEGRAM_CHANNEL", "")
 APPWRITE_ENDPOINT   = os.environ.get("APPWRITE_ENDPOINT", "https://cloud.appwrite.io/v1")
@@ -27,7 +28,7 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
 }
 
-# ─── Appwrite ──────────────────────────────────────────────────
+# ─── Appwrite (ارتباط با دیتابیس) ───────────────────────────────────
 def get_db():
     client = Client()
     client.set_endpoint(APPWRITE_ENDPOINT)
@@ -36,6 +37,7 @@ def get_db():
     return Databases(client)
 
 def is_published(databases, url: str) -> bool:
+    """بررسی اینکه آیا لینک خبر قبلاً در دیتابیس ثبت شده است یا خیر"""
     try:
         res = databases.list_documents(
             database_id=DATABASE_ID,
@@ -48,6 +50,7 @@ def is_published(databases, url: str) -> bool:
         return False
 
 def save_to_db(databases, url: str, title: str):
+    """ذخیره اطلاعات خبر منتشر شده در دیتابیس"""
     try:
         databases.create_document(
             database_id=DATABASE_ID,
@@ -62,9 +65,9 @@ def save_to_db(databases, url: str, title: str):
     except Exception as e:
         print(f"DB save error: {e}")
 
-# ─── دریافت اخبار از صفحه اصلی ────────────────────────────────
+# ─── دریافت اخبار از صفحه اصلی ASME ────────────────────────────────
 def fetch_headlines() -> list:
-    print("Fetching headlines...")
+    print("Fetching headlines from ASME...")
     try:
         resp = requests.get(HEADLINES_URL, headers=HEADERS, timeout=20)
         resp.raise_for_status()
@@ -79,56 +82,43 @@ def fetch_headlines() -> list:
         href = a_tag["href"].strip()
         title = a_tag.get_text(strip=True)
 
-        if not href.startswith("http"):
-            continue
-        if "asme.org" in href:
-            continue
-        if len(title) < 20:
+        if not href.startswith("http") or "asme.org" in href or len(title) < 20:
             continue
         
-        # نکته: روش استخراج منبع همچنان شکننده است.
-        # این کد به دنبال متن‌های هم‌سطح (sibling) با تگ لینک می‌گردد.
-        # اگر ساختار سایت ASME تغییر کند، این بخش ممکن است منبع را اشتباه تشخیص دهد.
-        # برای بهبود، باید ساختار دقیق HTML را بررسی و سلکتور بهتری پیدا کرد.
         source = ""
         parent = a_tag.find_parent()
         if parent:
             for sibling in parent.find_all(string=True, recursive=False):
                 s = sibling.strip()
                 if s and s != title and len(s) > 2:
-                    source = s[:80]
+                    source = s.replace("via ", "").strip()[:80]
                     break
 
         news_list.append({"url": href, "title": title, "source": source})
         print(f"  Found: {title[:70]}")
 
     print(f"Total found: {len(news_list)}")
-    return news_list[:5]
+    return news_list[:5] # محدود کردن به ۵ خبر آخر برای جلوگیری از تایم‌اوت
 
 # ─── استخراج متن از صفحه خبر (نسخه اصلاح شده و هوشمند) ───────────────
 def extract_article_text(url: str) -> str:
     """ورود به لینک خبر و استخراج هوشمند پاراگراف‌های اصلی با newspaper3k"""
     try:
-        # تنظیمات برای جلوگیری از خطای SSL و تعیین هدر
         config = Config()
         config.browser_user_agent = HEADERS["User-Agent"]
         config.request_timeout = 20
-        config.memoize_articles = False # جلوگیری از کش کردن در محیط سرورلس
+        config.memoize_articles = False
 
         article = Article(url, config=config)
         article.download()
         article.parse()
 
-        # استخراج متن اصلی و محدود کردن آن
         full_text = article.text
         if not full_text:
             return ""
 
-        # چند پاراگراف اول متن اصلی را برای خلاصه برمی‌گردانیم
         paragraphs = full_text.split('\n\n')
         summary_text = " ".join(paragraphs[:3])
-
-        # کوتاه کردن به ۸۰۰ کاراکتر برای جلوگیری از طولانی شدن
         return summary_text[:800]
 
     except Exception as e:
@@ -137,9 +127,6 @@ def extract_article_text(url: str) -> str:
 
 # ─── ترجمه با MyMemory ─────────────────────────────────────────
 def translate_to_persian(text: str) -> str:
-    # نکته: MyMemory یک سرویس رایگان با محدودیت‌هایی در کیفیت و تعداد درخواست است.
-    # برای ترجمه‌های تخصصی و دقیق‌تر، استفاده از APIهای پولی مانند
-    # Google Translate API یا DeepL API پیشنهاد می‌شود.
     if not text:
         return ""
     try:
@@ -154,8 +141,6 @@ def translate_to_persian(text: str) -> str:
         
         if result and result.lower() != text.lower():
             return result
-        
-        # اگر ترجمه موفق نبود، متن اصلی را برنگردان
         return ""
 
     except Exception as e:
@@ -170,9 +155,7 @@ def send_telegram(title_fa: str, summary_fa: str, source: str, news_url: str) ->
         msg_parts.append(f"{summary_fa.strip()}\n")
 
     if source:
-        # پاکسازی منبع از کاراکترهای اضافی
-        cleaned_source = source.replace("via ", "").strip()
-        msg_parts.append(f"🌐 *منبع:* {cleaned_source}")
+        msg_parts.append(f"🌐 *منبع:* {source}")
 
     msg_parts.append(f"🔗 [مشاهده خبر کامل]({news_url})")
     msg_parts.append("\n_via ASME In the Headlines_")
@@ -183,13 +166,7 @@ def send_telegram(title_fa: str, summary_fa: str, source: str, news_url: str) ->
         # کوتاه کردن پیام در صورت نیاز
         summary_cutoff = 4096 - len(title_fa) - len(source) - 200
         summary_fa_short = summary_fa[:summary_cutoff]
-        msg_parts = [
-            f"📰 *{title_fa.strip()}*\n",
-            f"{summary_fa_short}... (خلاصه شده)\n",
-            f"🌐 *منبع:* {source}",
-            f"🔗 [مشاهده خبر کامل]({news_url})",
-            "\n_via ASME In the Headlines_"
-        ]
+        msg_parts[1] = f"{summary_fa_short}... (خلاصه شده)\n"
         caption = "\n".join(msg_parts)
     
     api_base = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
@@ -212,7 +189,7 @@ def send_telegram(title_fa: str, summary_fa: str, source: str, news_url: str) ->
         print(f"Telegram exception: {e}")
         return False
 
-# ─── تابع اصلی ─────────────────────────────────────────────────
+# ─── تابع اصلی (ورودی فانکشن) ──────────────────────────────────────
 def main(context):
     print("=== ASME Bot Starting ===")
     
@@ -225,6 +202,7 @@ def main(context):
     news_list = fetch_headlines()
 
     if not news_list:
+        print("No new headlines found.")
         return context.res.json({"published": 0, "message": "No new headlines found"})
 
     new_count = 0
@@ -237,5 +215,43 @@ def main(context):
                 continue
 
             print(f"\nProcessing: {news['title'][:70]}")
+            
+            # ۱. استخراج متن اصلی
+            article_text = extract_article_text(news["url"])
+            print(f"  Extracted English Text Preview: {article_text[:150]}...")
+            print(f"  Article text length: {len(article_text)}")
+            time.sleep(1)
 
-            article_text = extract_article_text(news["url
+            # ۲. ترجمه عنوان
+            title_fa = translate_to_persian(news["title"])
+            print(f"  Title FA: {title_fa[:60]}")
+            time.sleep(1)
+
+            # ۳. ترجمه خلاصه
+            summary_fa = ""
+            if article_text:
+                summary_fa = translate_to_persian(article_text)
+                print(f"  Summary FA length: {len(summary_fa)}")
+                time.sleep(1)
+
+            # ۴. ارسال به تلگرام
+            ok = send_telegram(title_fa, summary_fa, news["source"], news["url"])
+
+            if ok:
+                save_to_db(databases, news["url"], news["title"])
+                new_count += 1
+                log.append(f"OK: {news['title'][:50]}")
+                time.sleep(2) # فاصله بین پست‌ها
+            else:
+                log.append(f"FAIL telegram: {news['title'][:40]}")
+
+        except Exception as e:
+            print(f"Unexpected error in main loop: {e}")
+            log.append(f"Error: {str(e)[:60]}")
+
+    print(f"\n=== Done. Published: {new_count}/{len(news_list)} ===")
+    return context.res.json({
+        "published": new_count,
+        "total_found": len(news_list),
+        "log": log
+    })
