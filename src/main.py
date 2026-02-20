@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import time
 import re
 from newspaper import Article, Config
-import google.genai as genai  # ✅ به‌روزرسانی به genai جدید
+import google.generativeai.genai as genai  # ✅ به‌روزرسانی به genai جدید
 
 # ─── 🔥 Environment Variables - رفع مشکل خواندن ─────────────────────────────
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN", "")
