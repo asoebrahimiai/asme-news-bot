@@ -13,8 +13,8 @@ from appwrite.id import ID
 from appwrite.query import Query
 from newspaper import Article, Config
 
-# ─── 🔇 Suppress Warnings ──────────────────────────────
-warnings.simplefilter("ignore")
+# ─── 🔇 Suppress Warnings (Including Appwrite Deprecations) ───
+warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 
 # ─── 🔥 ENV VARIABLES ──────────────────────────────────
@@ -27,34 +27,28 @@ DATABASE_ID        = os.getenv("APPWRITE_DATABASE_ID")
 COLLECTION_ID      = os.getenv("APPWRITE_COLLECTION_ID")
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY")
 
-# هدرهای فوق‌پیشرفته برای دور زدن فیلترهای ضد-ربات (Anti-Bot Bypass)
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9,fa;q=0.8',
-    'Accept-Encoding': 'gzip, deflate, br',
     'Connection': 'keep-alive',
     'Upgrade-Insecure-Requests': '1',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
     'Cache-Control': 'max-age=0',
 }
 
-# ─── 🌐 SITES TO MONITOR ───────────────────────────────
+# ─── 🌐 SITES TO MONITOR (Updated URLs & Selectors) ────
 SITES_TO_MONITOR = [
     {
         "source_name": "ASME",
         "url": "https://www.asme.org/about-asme/media-inquiries/asme-in-the-headlines",
         "base_url": "https://www.asme.org",
-        "link_selector": "article a, h2 a, h3 a, .headline-list a, div.sf_colsIn a"
+        "link_selector": ".headline-list a, article a, div.sf_colsIn a"
     },
     {
         "source_name": "MIT_MechE",
-        "url": "https://meche.mit.edu/news",
-        "base_url": "https://meche.mit.edu",
-        "link_selector": "article a, h2 a, h3 a, .view-content a, .views-row a"
+        "url": "https://news.mit.edu/topic/mechanical-engineering",
+        "base_url": "https://news.mit.edu",
+        "link_selector": ".term-page--news-article--item--title--link, h3.title a, h3 a"
     }
 ]
 
@@ -75,24 +69,29 @@ def get_db():
 
 def is_published(databases, url: str, context) -> bool:
     try:
-        res = databases.list_documents(DATABASE_ID, COLLECTION_ID, [Query.equal("news_url", [url])])
-        return res["total"] > 0
+        # Use fallback method for broader SDK compatibility
+        method = getattr(databases, "list_rows", getattr(databases, "list_documents", None))
+        if method:
+            res = method(DATABASE_ID, COLLECTION_ID, [Query.equal("news_url", [url])])
+            return res["total"] > 0
     except Exception as e:
         context.log(f"⚠️ DB Read Error: {e}")
-        return False
+    return False
 
 def save_to_db(databases, url: str, title: str, context):
     try:
-        databases.create_document(DATABASE_ID, COLLECTION_ID, ID.unique(), {
-            "news_url": url,
-            "title": title[:255],
-            "published_at": datetime.now(timezone.utc).isoformat()
-        })
-        context.log(f"✅ Saved to DB: {title[:20]}...")
+        method = getattr(databases, "create_row", getattr(databases, "create_document", None))
+        if method:
+            method(DATABASE_ID, COLLECTION_ID, ID.unique(), {
+                "news_url": url,
+                "title": title[:255],
+                "published_at": datetime.now(timezone.utc).isoformat()
+            })
+            context.log(f"✅ Saved to DB: {title[:20]}...")
     except Exception as e:
         context.log(f"❌ DB Save Error: {e}")
 
-# ─── 📰 News Fetching (V16 Architecture) ───────────────
+# ─── 📰 News Fetching (Smart Fallback) ─────────────────
 def fetch_headlines(context):
     all_news = []
 
@@ -102,28 +101,34 @@ def fetch_headlines(context):
             resp = requests.get(site["url"], headers=HEADERS, timeout=20)
             resp.raise_for_status()
             
-            # لاگ بسیار مهم برای بررسی بلاک شدن توسط Cloudflare
-            context.log(f"📄 Downloaded {len(resp.content)} bytes of HTML data.")
-            
+            context.log(f"📄 Downloaded {len(resp.content)} bytes.")
             soup = BeautifulSoup(resp.content, "html.parser")
             links = soup.select(site["link_selector"])
             
             if not links:
-                context.log(f"⚠️ Selectors failed for {site['source_name']}. Initiating Deep Scan Fallback...")
-                links = soup.find_all('a')
+                context.log(f"⚠️ Selectors failed for {site['source_name']}. Initiating Smart Fallback...")
+                # Search only in main content body to avoid Menus and Footers
+                main_area = soup.find('main') or soup.find(id=re.compile('main|content', re.I)) or soup.find('div', class_=re.compile('content|main', re.I)) or soup
+                links = main_area.find_all('a')
 
             context.log(f"👀 Filtering {len(links)} raw links...")
             site_news_count = 0
+
+            # Extended blacklist to prevent static pages from being identified as news
+            bad_words = [
+                'login', 'contact', 'privacy', 'terms', 'subscribe', 'cart', 'checkout', 
+                'register', 'javascript:', '#', 'events', 'certification', 'publications', 
+                'codes-standards', 'membership', 'about-asme', 'author', 'category'
+            ]
 
             for a in links:
                 href = a.get("href")
                 title = a.get_text(strip=True)
 
-                if not href or not title or len(title) < 25 or title.lower() in ['read more', 'continue']:
+                if not href or not title or len(title) < 30 or title.lower() in ['read more', 'continue']:
                     continue
 
                 full_url = urljoin(site["base_url"], href)
-                bad_words = ['login', 'contact', 'privacy', 'terms', 'subscribe', 'cart', 'checkout', 'register', 'javascript:', '#', 'events']
 
                 if not any(b in full_url.lower() for b in bad_words):
                     if not any(n['url'] == full_url for n in all_news):
@@ -264,7 +269,7 @@ def send_telegram(title_fa: str, summary_fa: str, source: str, url: str, image_u
 # ─── 🏁 Main Execution ────────────────────────────────
 def main(context):
     start_time = time.time()
-    context.log("🚀 NewsBot v16.0 - THE CLEAN SLATE Edition")
+    context.log("🚀 NewsBot v16.1 - SMART TARGETING Edition")
 
     db = get_db()
     headlines = fetch_headlines(context)
