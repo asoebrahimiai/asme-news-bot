@@ -31,22 +31,21 @@ HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9',
 }
 
-# ─── 🌐 SITES TO MONITOR (Multi-Site Configuration) ────
-# ─── 🌐 SITES TO MONITOR (Updated) ────
+# ─── 🌐 SITES TO MONITOR (Updated & Fixed) ────
 SITES_TO_MONITOR = [
     {
         "source_name": "ASME",
         "url": "https://www.asme.org/about-asme/media-inquiries/asme-in-the-headlines",
         "base_url": "https://www.asme.org",
-        # سلکتور بهبود یافته برای ASME
-        "link_selector": "div.sf_colsIn a" 
+        # پشتیبانی از تگ‌های بیشتر برای اطمینان از پیدا شدن اخبار
+        "link_selector": "div.sf_colsIn a, .headline-list a" 
     },
     {
         "source_name": "MIT_MechE",
-        "url": "https://meche.mit.edu/news-media/news", # لینک تصحیح شد
+        "url": "https://meche.mit.edu/news", 
         "base_url": "https://meche.mit.edu",
-        # سلکتور بهبود یافته برای MIT
-        "link_selector": "div.views-row a" 
+        # استفاده از سلکتورهای ترکیبی (کامای انگلیسی به معنی "یا" در سلکتور است)
+        "link_selector": "div.view-content a, div.views-row a, article a" 
     }
 ]
 # ─── 🛠 Helper Functions ──────────────────────────────
@@ -83,7 +82,7 @@ def save_to_db(databases, url: str, title: str, context):
     except Exception as e:
         context.log(f"❌ DB Save Error: {e}")
 
-# ─── 📰 News Fetching (IMPROVED) ──────────────
+# ─── 📰 News Fetching (IMPROVED & DEBUG MODE) ──────────────
 def fetch_headlines(context):
     all_news = []
     
@@ -97,40 +96,43 @@ def fetch_headlines(context):
             links = soup.select(site["link_selector"])
             site_news_count = 0
             
+            context.log(f"👀 Found {len(links)} raw links in {site['source_name']}. Filtering...")
+            
             for a in links:
                 href = a.get("href")
                 title = a.get_text(strip=True)
                 
-                # نادیده گرفتن لینک‌های خالی یا دکمه‌های ادامه مطلب
                 if not href or not title or title.lower() in ['read more', 'continue', 'learn more']: 
                     continue
                 
                 if href.startswith('/'): 
                     href = site["base_url"] + href
                 
-                # فیلتر کلمات مزاحم دقیق‌تر شد تا اخبار اصلی را حذف نکند
-                bad_words = ['login', 'contact', 'privacy', 'terms', 'subscribe', 'about-asme', 'events']
+                # 🛑 اصلاح مهم: کلمات 'about-asme' و 'events' حذف شدند تا اخبار واقعی مسدود نشوند!
+                bad_words = ['login', 'contact', 'privacy', 'terms', 'subscribe', 'cart', 'checkout']
                 
-                # اگر طول تیتر بیشتر از 20 حرف است و لینک جزو صفحات اصلی/ثابت سایت نیست
-                if len(title) > 20 and not any(b in href.lower() for b in bad_words):
-                    if not any(n['url'] == href for n in all_news):
-                        all_news.append({
-                            "url": href, 
-                            "title": title, 
-                            "source": site["source_name"]
-                        })
-                        site_news_count += 1
-                        context.log(f"🔗 Found: [{site['source_name']}] {title[:30]}...")
-                        
+                # فیلتر: طول تیتر بیشتر از 25 حرف باشد و کلمات ممنوعه در لینک نباشد
+                if len(title) > 25:
+                    if not any(b in href.lower() for b in bad_words):
+                        if not any(n['url'] == href for n in all_news):
+                            all_news.append({
+                                "url": href, 
+                                "title": title, 
+                                "source": site["source_name"]
+                            })
+                            site_news_count += 1
+                            context.log(f"✅ Extracted: [{site['source_name']}] {title[:35]}...")
+                            
+                # برداشتن نهایتاً ۳ خبر از هر سایت
                 if site_news_count >= 3:
                     break
                     
         except Exception as e:
             context.log(f"⚠️ Error fetching from {site['source_name']}: {e}")
             
-    context.log(f"📋 Total headlines found across all sites: {len(all_news)}")
+    context.log(f"📋 Total headlines approved across all sites: {len(all_news)}")
     return all_news
-
+    
 def extract_article_data(url: str, context) -> tuple[str, str]:
     text = ""
     image_url = ""
