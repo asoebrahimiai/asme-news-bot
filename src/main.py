@@ -32,24 +32,23 @@ HEADERS = {
 }
 
 # ─── 🌐 SITES TO MONITOR (Multi-Site Configuration) ────
+# ─── 🌐 SITES TO MONITOR (Updated) ────
 SITES_TO_MONITOR = [
     {
         "source_name": "ASME",
         "url": "https://www.asme.org/about-asme/media-inquiries/asme-in-the-headlines",
         "base_url": "https://www.asme.org",
-        # سلکتور برای پیدا کردن لینک اخبار در سایت ASME
+        # سلکتور بهبود یافته برای ASME
         "link_selector": "div.sf_colsIn a" 
     },
     {
         "source_name": "MIT_MechE",
-        "url": "https://meche.mit.edu/news",
+        "url": "https://meche.mit.edu/news-events", # لینک تصحیح شد
         "base_url": "https://meche.mit.edu",
-        # سلکتور برای پیدا کردن لینک اخبار در سایت دانشگاه MIT (مثال دوم)
-        "link_selector": "div.view-news-and-events span.field-content a"
+        # سلکتور بهبود یافته برای MIT
+        "link_selector": "div.views-row a" 
     }
-    # برای اضافه کردن سایت سوم، کافیست یک دیکشنری جدید مثل بالا اینجا اضافه کنید
 ]
-
 # ─── 🛠 Helper Functions ──────────────────────────────
 def full_escape_markdown_v2(text: str) -> str:
     escape_chars = r'_*[]()~`>#+-=|{}.!'
@@ -84,7 +83,7 @@ def save_to_db(databases, url: str, title: str, context):
     except Exception as e:
         context.log(f"❌ DB Save Error: {e}")
 
-# ─── 📰 News Fetching (MULTI-SITE LOGIC) ──────────────
+# ─── 📰 News Fetching (IMPROVED) ──────────────
 def fetch_headlines(context):
     all_news = []
     
@@ -95,7 +94,6 @@ def fetch_headlines(context):
             resp.raise_for_status()
             soup = BeautifulSoup(resp.content, "html.parser")
             
-            # پیدا کردن تمام لینک‌ها بر اساس سلکتور اختصاصی همان سایت
             links = soup.select(site["link_selector"])
             site_news_count = 0
             
@@ -103,17 +101,18 @@ def fetch_headlines(context):
                 href = a.get("href")
                 title = a.get_text(strip=True)
                 
-                if not href or not title: 
+                # نادیده گرفتن لینک‌های خالی یا دکمه‌های ادامه مطلب
+                if not href or not title or title.lower() in ['read more', 'continue', 'learn more']: 
                     continue
                 
-                # اصلاح لینک‌های نسبی به لینک کامل
                 if href.startswith('/'): 
                     href = site["base_url"] + href
                 
-                # فیلتر کلمات مزاحم در لینک‌ها
-                bad_words = ['about-asme', 'media-inquiries', 'login', 'contact', 'privacy', 'terms', 'subscribe']
-                if len(title) > 25 and not any(b in href.lower() for b in bad_words):
-                    # جلوگیری از اضافه شدن لینک تکراری در یک اجرا
+                # فیلتر کلمات مزاحم دقیق‌تر شد تا اخبار اصلی را حذف نکند
+                bad_words = ['login', 'contact', 'privacy', 'terms', 'subscribe', 'about-asme', 'events']
+                
+                # اگر طول تیتر بیشتر از 20 حرف است و لینک جزو صفحات اصلی/ثابت سایت نیست
+                if len(title) > 20 and not any(b in href.lower() for b in bad_words):
                     if not any(n['url'] == href for n in all_news):
                         all_news.append({
                             "url": href, 
@@ -121,8 +120,8 @@ def fetch_headlines(context):
                             "source": site["source_name"]
                         })
                         site_news_count += 1
+                        context.log(f"🔗 Found: [{site['source_name']}] {title[:30]}...")
                         
-                # از هر سایت نهایتاً 3 خبر آخر را بردار تا پردازش طولانی نشود
                 if site_news_count >= 3:
                     break
                     
