@@ -49,7 +49,19 @@ SITES_TO_MONITOR = [
         "url": "https://news.mit.edu/topic/mechanical-engineering",
         "base_url": "https://news.mit.edu",
         "link_selector": ".term-page--news-article--item--title--link, h3.title a, h3 a"
-    }
+    },
+    {
+        "source_name": "machinedesign",
+        "url": "https://www.machinedesign.com/materials",
+        "base_url": "https://www.machinedesign.com/",
+        "link_selector": ".term-page--news-article--item--title--link, h3.title a, h3 a"
+    },
+    {
+        "source_name": "machinedesign",
+        "url": "https://www.machinedesign.com/mechanical-motion-systems",
+        "base_url": "https://www.machinedesign.com/",
+        "link_selector": ".term-page--news-article--item--title--link, h3.title a, h3 a"
+    }    
 ]
 
 # ─── 🛠 Helper Functions ──────────────────────────────
