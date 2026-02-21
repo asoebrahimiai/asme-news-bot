@@ -5,7 +5,7 @@ import re
 import warnings
 import json
 from datetime import datetime, timezone
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from appwrite.client import Client
 from appwrite.services.databases import Databases
@@ -13,7 +13,7 @@ from appwrite.id import ID
 from appwrite.query import Query
 from newspaper import Article, Config
 
-# ─── 🔇 Suppress Warnings (Including Appwrite Deprecations) ───
+# ─── 🔇 Suppress Warnings ──────────────────────────────
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 
@@ -36,7 +36,7 @@ HEADERS = {
     'Cache-Control': 'max-age=0',
 }
 
-# ─── 🌐 SITES TO MONITOR (Updated URLs & Selectors) ────
+# ─── 🌐 SITES TO MONITOR ───────────────────────────────
 SITES_TO_MONITOR = [
     {
         "source_name": "ASME",
@@ -51,17 +51,17 @@ SITES_TO_MONITOR = [
         "link_selector": ".term-page--news-article--item--title--link, h3.title a, h3 a"
     },
     {
-        "source_name": "machinedesign",
+        "source_name": "MachineDesign_Materials",
         "url": "https://www.machinedesign.com/materials",
-        "base_url": "https://www.machinedesign.com/",
-        "link_selector": ".term-page--news-article--item--title--link, h3.title a, h3 a"
+        "base_url": "https://www.machinedesign.com",
+        "link_selector": ".article-teaser a, .teaser-title a, h2.title a, h3 a"
     },
     {
-        "source_name": "machinedesign",
+        "source_name": "MachineDesign_Motion",
         "url": "https://www.machinedesign.com/mechanical-motion-systems",
-        "base_url": "https://www.machinedesign.com/",
-        "link_selector": ".term-page--news-article--item--title--link, h3.title a, h3 a"
-    }    
+        "base_url": "https://www.machinedesign.com",
+        "link_selector": ".article-teaser a, .teaser-title a, h2.title a, h3 a"
+    }
 ]
 
 # ─── 🛠 Helper Functions ──────────────────────────────
@@ -81,7 +81,6 @@ def get_db():
 
 def is_published(databases, url: str, context) -> bool:
     try:
-        # Use fallback method for broader SDK compatibility
         method = getattr(databases, "list_rows", getattr(databases, "list_documents", None))
         if method:
             res = method(DATABASE_ID, COLLECTION_ID, [Query.equal("news_url", [url])])
@@ -103,7 +102,7 @@ def save_to_db(databases, url: str, title: str, context):
     except Exception as e:
         context.log(f"❌ DB Save Error: {e}")
 
-# ─── 📰 News Fetching (Smart Fallback) ─────────────────
+# ─── 📰 News Fetching (Domain Locked) ──────────────────
 def fetch_headlines(context):
     all_news = []
 
@@ -112,25 +111,24 @@ def fetch_headlines(context):
         try:
             resp = requests.get(site["url"], headers=HEADERS, timeout=20)
             resp.raise_for_status()
-            
-            context.log(f"📄 Downloaded {len(resp.content)} bytes.")
+
             soup = BeautifulSoup(resp.content, "html.parser")
             links = soup.select(site["link_selector"])
-            
+
             if not links:
                 context.log(f"⚠️ Selectors failed for {site['source_name']}. Initiating Smart Fallback...")
-                # Search only in main content body to avoid Menus and Footers
                 main_area = soup.find('main') or soup.find(id=re.compile('main|content', re.I)) or soup.find('div', class_=re.compile('content|main', re.I)) or soup
                 links = main_area.find_all('a')
 
-            context.log(f"👀 Filtering {len(links)} raw links...")
             site_news_count = 0
+            base_domain = urlparse(site["base_url"]).netloc.replace('www.', '')
 
-            # Extended blacklist to prevent static pages from being identified as news
+            # Extended blacklist
             bad_words = [
-                'login', 'contact', 'privacy', 'terms', 'subscribe', 'cart', 'checkout', 
-                'register', 'javascript:', '#', 'events', 'certification', 'publications', 
-                'codes-standards', 'membership', 'about-asme', 'author', 'category'
+                'login', 'contact', 'privacy', 'terms', 'subscribe', 'cart', 'checkout',
+                'register', 'javascript:', '#', 'events', 'certification', 'publications',
+                'codes-standards', 'membership', 'about', 'author', 'category', 'webinar',
+                'whitepaper', 'directory', 'video', 'podcast'
             ]
 
             for a in links:
@@ -141,6 +139,11 @@ def fetch_headlines(context):
                     continue
 
                 full_url = urljoin(site["base_url"], href)
+                full_domain = urlparse(full_url).netloc
+
+                # 🔒 DOMAIN LOCK: Skip if link goes to an external site (Twitter, LinkedIn, etc.)
+                if base_domain not in full_domain:
+                    continue
 
                 if not any(b in full_url.lower() for b in bad_words):
                     if not any(n['url'] == full_url for n in all_news):
@@ -247,7 +250,7 @@ def send_telegram(title_fa: str, summary_fa: str, source: str, url: str, image_u
     safe_title = full_escape_markdown_v2(title_fa)
     safe_source = full_escape_markdown_v2(source)
     safe_url = url_safe_encode(url)
-    
+
     if len(summary_fa) > 850: summary_fa = summary_fa[:850] + "..."
     safe_summary = full_escape_markdown_v2(summary_fa)
 
@@ -255,7 +258,7 @@ def send_telegram(title_fa: str, summary_fa: str, source: str, url: str, image_u
 
     api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto" if image_url and image_url.startswith('http') else f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHANNEL, "parse_mode": "MarkdownV2"}
-    
+
     if "sendPhoto" in api_url:
         payload["photo"] = image_url
         payload["caption"] = caption
@@ -281,7 +284,7 @@ def send_telegram(title_fa: str, summary_fa: str, source: str, url: str, image_u
 # ─── 🏁 Main Execution ────────────────────────────────
 def main(context):
     start_time = time.time()
-    context.log("🚀 NewsBot v16.1 - SMART TARGETING Edition")
+    context.log("🚀 NewsBot v16.2 - DOMAIN LOCK Edition")
 
     db = get_db()
     headlines = fetch_headlines(context)
