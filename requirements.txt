@@ -1,6 +1,6 @@
-requests
-beautifulsoup4
-appwrite
-newspaper3k
-lxml[html_clean]
+appwrite==15.2.0
+beautifulsoup4==4.12.3
+requests==2.32.3
+newspaper3k==0.2.8
+lxml[html_clean]==6.0.2
 python-telegram-bot==20.7
