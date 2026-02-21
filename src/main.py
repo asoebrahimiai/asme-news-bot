@@ -43,7 +43,7 @@ SITES_TO_MONITOR = [
     },
     {
         "source_name": "MIT_MechE",
-        "url": "https://meche.mit.edu/news-events", # لینک تصحیح شد
+        "url": "https://meche.mit.edu/news-media/news", # لینک تصحیح شد
         "base_url": "https://meche.mit.edu",
         # سلکتور بهبود یافته برای MIT
         "link_selector": "div.views-row a" 
