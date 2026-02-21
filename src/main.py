@@ -32,6 +32,7 @@ HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9',
 }
 
+# ─── 🛠 Helper Functions ──────────────────────────────
 def full_escape_markdown_v2(text: str) -> str:
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     text = re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
@@ -40,7 +41,7 @@ def full_escape_markdown_v2(text: str) -> str:
 def url_safe_encode(url: str) -> str:
     return requests.utils.quote(url, safe=':/?#[]@!$&\'()*+,;=')
 
-# ─── Appwrite DB ──────────────────────────────────────
+# ─── 💾 Appwrite DB ───────────────────────────────────
 def get_db():
     client = Client()
     client.set_endpoint(APPWRITE_ENDPOINT).set_project(APPWRITE_PROJECT_ID).set_key(APPWRITE_API_KEY)
@@ -48,7 +49,6 @@ def get_db():
 
 def is_published(databases, url: str, context) -> bool:
     try:
-        # تغییر یافته به news_url طبق درخواست شما
         res = databases.list_documents(DATABASE_ID, COLLECTION_ID, [Query.equal("news_url", [url])])
         return res["total"] > 0
     except Exception as e:
@@ -58,15 +58,15 @@ def is_published(databases, url: str, context) -> bool:
 def save_to_db(databases, url: str, title: str, context):
     try:
         databases.create_document(DATABASE_ID, COLLECTION_ID, ID.unique(), {
-            "news_url": url, # تغییر یافته به news_url
+            "news_url": url,
             "title": title[:255],
             "published_at": datetime.now(timezone.utc).isoformat()
         })
-        context.log("✅ Saved to DB successfully.")
+        context.log("✅ Saved to DB.")
     except Exception as e:
         context.log(f"❌ DB Save Error: {e}")
 
-# ─── News Fetching ─────────────────────────────────────
+# ─── 📰 News Fetching & Cleaning ──────────────────────
 def fetch_headlines(context):
     try:
         resp = requests.get(HEADLINES_URL, headers=HEADERS, timeout=15)
@@ -79,10 +79,11 @@ def fetch_headlines(context):
         news = []
         for a in content.find_all("a", href=True):
             href, title = a["href"], a.get_text(strip=True)
-            if href.startswith('/'):
-                href = "https://www.asme.org" + href
+            if href.startswith('/'): href = "https://www.asme.org" + href
             
-            if len(title) > 30 and not any(b in href.lower() for b in ['about-asme', 'media-inquiries', 'login']):
+            # فیلترهای اولیه برای حذف لینک‌های غیرخبری
+            bad_words = ['about-asme', 'media-inquiries', 'login', 'contact', 'privacy', 'terms']
+            if len(title) > 30 and not any(b in href.lower() for b in bad_words):
                 if not any(n['url'] == href for n in news):
                     news.append({"url": href, "title": title, "source": "ASME"})
                     
@@ -91,58 +92,70 @@ def fetch_headlines(context):
         context.log(f"Error fetching headlines: {e}")
         return []
 
-# ─── Article Extract (Text & Image) ────────────────────
 def extract_article_data(url: str, context) -> tuple[str, str]:
     text = ""
     image_url = ""
     
-    # اولویت اول: Newspaper3k (برای استخراج هوشمند متن اصلی و عکس بدون اضافات سایت)
+    # متد 1: Newspaper3k (معمولاً هوشمندتر است)
     try:
         config = Config(fetch_images=True, browser_user_agent=HEADERS['User-Agent'], request_timeout=15)
         article = Article(url, config=config)
         article.download()
         article.parse()
         text = article.text.strip()
-        image_url = article.top_image # استخراج عکس اصلی
-        if len(text) > 100:
-            context.log("✅ Extracted text and image using newspaper3k.")
-            return text, image_url
-    except Exception as e:
-        context.log(f"Newspaper3k error: {e}")
-
-    # اولویت دوم: BeautifulSoup (فقط در صورت شکست اولویت اول)
-    context.log("⚠️ Falling back to BeautifulSoup...")
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        if resp.status_code == 200:
-            soup = BeautifulSoup(resp.content, "html.parser")
-            
-            if not image_url:
-                og_image = soup.find("meta", property="og:image")
-                if og_image: image_url = og_image.get("content", "")
-
-            paragraphs = soup.find_all('p')
-            text = "\n".join([p.get_text(strip=True) for p in paragraphs])
+        image_url = article.top_image
     except Exception:
         pass
-        
+
+    # اگر متن خیلی کوتاه بود یا پیدا نشد، برو سراغ متد 2
+    if len(text) < 200:
+        context.log("⚠️ Newspaper3k yielded short text, trying BeautifulSoup cleaning...")
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.content, "html.parser")
+                
+                # حذف تگ‌های مزاحم (تبلیغات، منوها، فوتر)
+                for script in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
+                    script.decompose()
+                
+                # پیدا کردن بدنه اصلی مقاله
+                article_body = soup.find('article') or soup.find('main') or soup.find('div', class_='content') or soup.body
+                
+                if article_body:
+                    paragraphs = article_body.find_all('p')
+                    # فقط پاراگراف‌هایی که طولانی هستند را نگه دار (حذف تیترهای تبلیغاتی کوتاه)
+                    clean_paragraphs = [p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 60]
+                    text = "\n".join(clean_paragraphs)
+                    
+                    if not image_url:
+                        og_image = soup.find("meta", property="og:image")
+                        if og_image: image_url = og_image.get("content", "")
+        except Exception:
+            pass
+
     return text, image_url
 
-# ─── 🦙 Groq Logic (JSON Mode) ─────────────────────────
+# ─── 🧠 Groq AI Logic (Strict JSON) ───────────────────
 def summarize_with_groq(title: str, text: str, context) -> tuple[str, str]:
-    if not GROQ_API_KEY or len(text) < 100:
-        return title, "متن مقاله برای پردازش بسیار کوتاه است یا GROQ_API_KEY تنظیم نشده است."
+    if not GROQ_API_KEY:
+        return title, "کلید GROQ_API_KEY تنظیم نشده است."
 
-    # درخواست اکید از هوش مصنوعی برای بازگرداندن فرمت JSON
-    prompt = f"""Translate the title to Persian and summarize the text in Persian.
-Source Title: {title}
-Source Text: {text[:3000]}
+    # پرامپت بسیار سخت‌گیرانه برای جلوگیری از توهم و ترجمه متون نامربوط
+    prompt = f"""You are a professional engineering news editor.
+    
+    Task 1: Read the text below. Ignore any "Recommended for you", "Related stories", or advertisements at the end. Focus ONLY on the main story related to the title.
+    Task 2: Translate the title to Persian.
+    Task 3: Summarize the MAIN story in Persian (2 paragraphs). Do not include unrelated topics like 'dog rescue' or 'scandals' unless they are the main topic.
 
-You must respond ONLY with a valid JSON object using this exact structure:
-{{
-  "title_fa": "Persian translation of the title",
-  "summary_fa": "Persian summary in 2 informative paragraphs"
-}}"""
+    Source Title: {title}
+    Source Text: {text[:3500]}
+
+    Output JSON Format:
+    {{
+      "title_fa": "Persian Title",
+      "summary_fa": "Persian Summary"
+    }}"""
 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
@@ -153,145 +166,119 @@ You must respond ONLY with a valid JSON object using this exact structure:
     payload = {
         "model": "llama-3.3-70b-versatile",
         "messages": [
-            {"role": "system", "content": "You are a professional technical translator for engineering news. Respond ONLY in valid JSON."},
+            {"role": "system", "content": "You are a JSON-only response bot. You filter out junk text."},
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.3,
-        "response_format": {"type": "json_object"} # فعال‌سازی حالت JSON
+        "temperature": 0.2, # کاهش خلاقیت برای دقت بیشتر
+        "response_format": {"type": "json_object"}
     }
     
     try:
-        context.log("🤖 Sending to Groq API (JSON mode)...")
-        resp = requests.post(url, headers=headers, json=payload, timeout=25)
+        resp = requests.post(url, headers=headers, json=payload, timeout=30)
         
         if resp.status_code == 200:
             data = resp.json()
-            res_content = data['choices'][0]['message']['content']
-            
-            # پارس کردن خروجی تمیز JSON
-            parsed_json = json.loads(res_content)
-            t_fa = parsed_json.get("title_fa", title)
-            s_fa = parsed_json.get("summary_fa", "خلاصه دریافت نشد.")
-            
-            context.log("✅ Groq AI Success (JSON Parsed)")
-            return t_fa, s_fa
-            
+            content_str = data['choices'][0]['message']['content']
+            parsed = json.loads(content_str)
+            return parsed.get("title_fa", title), parsed.get("summary_fa", "خلاصه تولید نشد.")
         else:
-            context.log(f"⚠️ Groq Failed: {resp.status_code} - {resp.text}")
-            return title, f"⚠️ خطای سرور Groq (کد {resp.status_code})."
+            context.log(f"⚠️ Groq Error: {resp.status_code} - {resp.text}")
+            # اگر خطای ۴۲۹ یا ۵۰۰ داد، ارور واقعی گروق را برمی‌گرداند نه ارور گوگل را
+            return title, f"خطای سرویس هوش مصنوعی Groq (کد {resp.status_code})"
             
     except Exception as e:
-        context.log(f"💥 Groq Request Error: {e}")
-        return title, "خطا در ارتباط با هوش مصنوعی Groq."
+        context.log(f"💥 Groq Exception: {e}")
+        return title, "خطا در ارتباط با سرور هوش مصنوعی."
 
-# ─── 🚀 Telegram Logic (With Photo) ─────────────────────
+# ─── ✈️ Telegram Sender ───────────────────────────────
 def send_telegram(title_fa: str, summary_fa: str, source: str, url: str, image_url: str, context) -> bool:
     safe_title = full_escape_markdown_v2(title_fa)
     safe_source = full_escape_markdown_v2(source)
     safe_url = url_safe_encode(url)
-
-    # محدودیت کپشن عکس در تلگرام ۱۰۲۴ کاراکتر است، بنابراین متن خلاصه را در صورت نیاز کوتاه می‌کنیم
-    if image_url:
-        max_summary_length = 800 
-        if len(summary_fa) > max_summary_length:
-            summary_fa = summary_fa[:max_summary_length] + "..."
-            
+    
+    # کوتاه کردن خلاصه اگر خیلی طولانی بود (برای کپشن عکس)
+    if len(summary_fa) > 850: summary_fa = summary_fa[:850] + "..."
     safe_summary = full_escape_markdown_v2(summary_fa)
+
     caption = f"*{safe_title}*\n\n{safe_summary}\n\n🌐 منبع: {safe_source}\n🔗 [مشاهده کامل]({safe_url})"
+    
+    # متد ارسال عکس
+    if image_url and image_url.startswith('http'):
+        api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+        payload = {
+            "chat_id": TELEGRAM_CHANNEL, 
+            "photo": image_url, 
+            "caption": caption, 
+            "parse_mode": "MarkdownV2"
+        }
+    else:
+        # متد ارسال متن (اگر عکس نبود)
+        api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHANNEL, 
+            "text": caption, 
+            "parse_mode": "MarkdownV2",
+            "disable_web_page_preview": False
+        }
 
     try:
-        # اگر عکس پیدا شد، پیام تصویری ارسال می‌شود
-        if image_url and image_url.startswith('http'):
-            api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-            payload = {
-                "chat_id": TELEGRAM_CHANNEL,
-                "photo": image_url,
-                "caption": caption,
-                "parse_mode": "MarkdownV2"
-            }
-            context.log("🖼️ Sending as Photo to Telegram...")
-        # اگر عکس نداشت، پیام متنی ساده ارسال می‌شود
-        else:
-            api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            payload = {
-                "chat_id": TELEGRAM_CHANNEL,
-                "text": caption,
-                "parse_mode": "MarkdownV2",
-                "disable_web_page_preview": False
-            }
-            context.log("📝 Sending as Text to Telegram...")
-
-        resp = requests.post(api_url, json=payload, timeout=15)
-
+        resp = requests.post(api_url, json=payload, timeout=20)
         if resp.status_code == 200:
-            context.log("✅ Telegram sent successfully.")
+            context.log("✅ Telegram sent.")
             return True
         else:
-            context.log(f"❌ Telegram Error {resp.status_code}: {resp.text}")
-            
-            # سیستم نجات: اگر ارسال عکس به دلیل خطای سایز یا فرمت خراب شد، پیام متنی را امتحان کن
-            if image_url:
-                context.log("🔄 Retrying as Text message due to Photo failure...")
-                api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            context.log(f"❌ TG Error {resp.status_code}: {resp.text}")
+            # اگر ارسال عکس شکست خورد، متن خالی بفرست
+            if "photo" in payload:
+                context.log("🔄 Retrying as text...")
+                payload.pop("photo")
+                payload.pop("caption")
                 payload["text"] = caption
-                payload["disable_web_page_preview"] = False
-                payload.pop("photo", None)
-                payload.pop("caption", None)
-                retry_resp = requests.post(api_url, json=payload, timeout=15)
-                if retry_resp.status_code == 200:
-                    context.log("✅ Fallback Telegram text sent successfully.")
-                    return True
-
+                api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                requests.post(api_url, json=payload, timeout=20)
+                return True
     except Exception as e:
-        context.log(f"💥 Telegram Net Error: {e}")
+        context.log(f"💥 TG Network Error: {e}")
+    
     return False
 
-# ─── 🎯 MAIN FUNCTION ──────────────────────────────────
+# ─── 🏁 Main Execution ────────────────────────────────
 def main(context):
     start_time = time.time()
-    context.log("🚀 NewsBot v12.0 - With Images & JSON Logic")
+    context.log("🚀 NewsBot v13.0 - CLEAN & PURE GROQ")
 
     if not all([TELEGRAM_TOKEN, TELEGRAM_CHANNEL, GROQ_API_KEY]):
-        context.log("❌ Missing Environment Variables")
+        context.log("❌ CRITICAL: Missing ENV Variables")
         return context.res.json({"error": "Missing ENV"})
 
     db = get_db()
     headlines = fetch_headlines(context)
-    context.log(f"📋 Found {len(headlines)} headlines")
-
-    if not headlines:
-        return context.res.json({"ok": True, "msg": "No headlines"})
-
-    success_count = 0
     
+    success_count = 0
     for item in headlines:
-        if time.time() - start_time > 100:
-            context.log("⚠️ Timeout approaching. Stopping.")
-            break
-
-        context.log(f"🔄 Processing: {item['title'][:40]}...")
+        if time.time() - start_time > 110: break # جلوگیری از تایم‌اوت
 
         if is_published(db, item['url'], context):
-            context.log("⏭️ Already in DB.")
+            context.log(f"⏭️ Skipping (Exists): {item['title'][:20]}...")
             continue
 
-        # استخراج متن و عکس
+        context.log(f"🔄 Processing: {item['title'][:30]}...")
         text, image_url = extract_article_data(item['url'], context)
         
-        if len(text) < 100:
-            context.log("⏭️ Text too short. Skipping.")
+        # اگر متن اصلی پیدا نشد یا خیلی کوتاه بود (احتمالاً صفحه لاگین یا ویدیو)
+        if len(text) < 150:
+            context.log("⚠️ Text too short/irrelevant. Skipping.")
             continue
 
-        # تولید محتوا با Groq (فرمت JSON)
         title_fa, summary_fa = summarize_with_groq(item['title'], text, context)
 
-        # ارسال به تلگرام به همراه عکس
+        # اگر خروجی هنوز حاوی ارور قدیمی گوگل بود (محض احتیاط)
+        if "محدودیت استفاده رایگان" in summary_fa:
+            summary_fa = "خطای غیرمنتظره در پردازش متن."
+
         if send_telegram(title_fa, summary_fa, item['source'], item['url'], image_url, context):
             save_to_db(db, item['url'], item['title'], context)
             success_count += 1
             time.sleep(2)
 
-    exec_time = round(time.time() - start_time, 2)
-    context.log(f"🎉 Finished. Sent: {success_count} | Time: {exec_time}s")
-    
-    return context.res.json({"ok": True, "published": success_count})
+    return context.res.json({"ok": True, "sent": success_count})
