@@ -50,8 +50,8 @@ def get_db():
 
 def is_published(databases, url: str, context) -> bool:
     try:
-        # جستجو بر اساس new_url
-        res = databases.list_documents(DATABASE_ID, COLLECTION_ID, [Query.equal("new_url", [url])])
+        # جستجو بر اساس news_url
+        res = databases.list_documents(DATABASE_ID, COLLECTION_ID, [Query.equal("news_url", [url])])
         return res["total"] > 0
     except Exception as e:
         context.log(f"⚠️ DB Read Error: {e}")
@@ -60,7 +60,7 @@ def is_published(databases, url: str, context) -> bool:
 def save_to_db(databases, url: str, title: str, context):
     try:
         databases.create_document(DATABASE_ID, COLLECTION_ID, ID.unique(), {
-            "new_url": url,
+            "news_url": url,
             "title": title[:255],
             "published_at": datetime.now(timezone.utc).isoformat()
         })
