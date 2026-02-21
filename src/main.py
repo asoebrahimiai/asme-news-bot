@@ -86,7 +86,7 @@ def fetch_headlines(context):
                 if not any(n['url'] == href for n in news):
                     news.append({"url": href, "title": title, "source": "ASME"})
                     
-        return news[:3]
+        return news[:5]
     except Exception as e:
         context.log(f"Error fetching headlines: {e}")
         return []
