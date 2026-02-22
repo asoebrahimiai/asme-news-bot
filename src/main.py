@@ -4,6 +4,7 @@ import time
 import re
 import warnings
 import json
+import random
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
@@ -13,7 +14,7 @@ from appwrite.id import ID
 from appwrite.query import Query
 from newspaper import Article, Config
 
-# ─── 🔇 Suppress Warnings ──────────────────────────────
+# ─── 🔇 Suppress Warnings (Clean Logs) ─────────────────
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 
@@ -80,34 +81,45 @@ def get_db():
     return Databases(client)
 
 def is_published(databases, url: str, context) -> bool:
-    try:
-        method = getattr(databases, "list_rows", getattr(databases, "list_documents", None))
-        if method:
-            res = method(DATABASE_ID, COLLECTION_ID, [Query.equal("news_url", [url])])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            res = databases.list_documents(DATABASE_ID, COLLECTION_ID, [Query.equal("news_url", [url])])
             return res["total"] > 0
-    except Exception as e:
-        context.log(f"⚠️ DB Read Error: {e}")
-    return False
+        except Exception as e:
+            # Silently ignore Appwrite deprecation warnings, log real errors
+            if "deprecated" not in str(e).lower():
+                context.log(f"⚠️ DB Read Error: {e}")
+        return False
 
 def save_to_db(databases, url: str, title: str, context):
-    try:
-        method = getattr(databases, "create_row", getattr(databases, "create_document", None))
-        if method:
-            method(DATABASE_ID, COLLECTION_ID, ID.unique(), {
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        try:
+            databases.create_document(DATABASE_ID, COLLECTION_ID, ID.unique(), {
                 "news_url": url,
                 "title": title[:255],
                 "published_at": datetime.now(timezone.utc).isoformat()
             })
             context.log(f"✅ Saved to DB: {title[:20]}...")
-    except Exception as e:
-        context.log(f"❌ DB Save Error: {e}")
+        except Exception as e:
+            if "deprecated" not in str(e).lower():
+                context.log(f"❌ DB Save Error: {e}")
 
-# ─── 📰 News Fetching (Domain Locked) ──────────────────
+# ─── 📰 News Fetching (Random Pool Edition) ────────────
 def fetch_headlines(context):
     all_news = []
+    
+    # Extended blacklist for better random picking
+    bad_words = [
+        'login', 'contact', 'privacy', 'terms', 'subscribe', 'cart', 'checkout',
+        'register', 'javascript:', '#', 'events', 'certification', 'publications',
+        'codes-standards', 'membership', 'about', 'author', 'category', 'webinar',
+        'whitepaper', 'directory', 'video', 'podcast', 'gallery', 'index'
+    ]
 
     for site in SITES_TO_MONITOR:
-        context.log(f"\n🔍 Scanning site: {site['source_name']}")
+        context.log(f"\n🔍 Deep Scanning site: {site['source_name']}")
         try:
             resp = requests.get(site["url"], headers=HEADERS, timeout=20)
             resp.raise_for_status()
@@ -120,16 +132,8 @@ def fetch_headlines(context):
                 main_area = soup.find('main') or soup.find(id=re.compile('main|content', re.I)) or soup.find('div', class_=re.compile('content|main', re.I)) or soup
                 links = main_area.find_all('a')
 
-            site_news_count = 0
             base_domain = urlparse(site["base_url"]).netloc.replace('www.', '')
-
-            # Extended blacklist
-            bad_words = [
-                'login', 'contact', 'privacy', 'terms', 'subscribe', 'cart', 'checkout',
-                'register', 'javascript:', '#', 'events', 'certification', 'publications',
-                'codes-standards', 'membership', 'about', 'author', 'category', 'webinar',
-                'whitepaper', 'directory', 'video', 'podcast'
-            ]
+            site_gathered = 0
 
             for a in links:
                 href = a.get("href")
@@ -141,7 +145,7 @@ def fetch_headlines(context):
                 full_url = urljoin(site["base_url"], href)
                 full_domain = urlparse(full_url).netloc
 
-                # 🔒 DOMAIN LOCK: Skip if link goes to an external site (Twitter, LinkedIn, etc.)
+                # 🔒 DOMAIN LOCK
                 if base_domain not in full_domain:
                     continue
 
@@ -152,16 +156,16 @@ def fetch_headlines(context):
                             "title": title,
                             "source": site["source_name"]
                         })
-                        site_news_count += 1
-                        context.log(f"✅ Extracted: {title[:35]}...")
-
-                if site_news_count >= 3:
-                    break
+                        site_gathered += 1
+                        
+            context.log(f"✔️ Gathered {site_gathered} potential links from {site['source_name']}")
 
         except Exception as e:
             context.log(f"⚠️ Error fetching from {site['source_name']}: {e}")
 
-    context.log(f"\n📋 Total approved headlines across all sites: {len(all_news)}")
+    # 🔀 Shuffle the entire pool to ensure random selection regardless of publish date
+    random.shuffle(all_news)
+    context.log(f"\n📋 Total shuffled pool size: {len(all_news)}")
     return all_news
 
 def extract_article_data(url: str, context) -> tuple[str, str]:
@@ -284,26 +288,36 @@ def send_telegram(title_fa: str, summary_fa: str, source: str, url: str, image_u
 # ─── 🏁 Main Execution ────────────────────────────────
 def main(context):
     start_time = time.time()
-    context.log("🚀 NewsBot v16.2 - DOMAIN LOCK Edition")
+    context.log("🚀 NewsBot v17.0 - RANDOM POOL Edition")
 
     db = get_db()
+    
+    # 1. Get the massively shuffled pool of links
     headlines = fetch_headlines(context)
 
+    TARGET_POSTS = 3
     success_count = 0
+    
+    # 2. Loop through the random pool until we hit 3 successful posts
     for item in headlines:
+        if success_count >= TARGET_POSTS:
+            context.log(f"🎉 Target reached! Sent {TARGET_POSTS} news items.")
+            break
+            
+        # Appwrite server timeout protection (stop at 110 seconds)
         if time.time() - start_time > 110:
-            context.log("⏱️ Time limit reached. Stopping.")
+            context.log("⏱️ Time limit reached. Stopping execution to prevent timeout.")
             break
 
         if is_published(db, item['url'], context):
-            context.log(f"⏭️ Skipping (Exists in DB): {item['title'][:20]}...")
+            # No need to log skipped ones anymore, to keep logs clean
             continue
 
-        context.log(f"🔄 Processing: {item['title'][:30]}...")
+        context.log(f"🔄 Processing potential news: {item['title'][:30]}...")
         text, image_url = extract_article_data(item['url'], context)
 
         if len(text) < 150:
-            context.log("⚠️ Text too short. Skipping.")
+            context.log("⚠️ Text too short. Skipping to next random link.")
             continue
 
         title_fa, summary_fa = summarize_with_groq(item['title'], text, context)
@@ -311,6 +325,7 @@ def main(context):
         if send_telegram(title_fa, summary_fa, item['source'], item['url'], image_url, context):
             save_to_db(db, item['url'], item['title'], context)
             success_count += 1
-            time.sleep(2)
+            time.sleep(2) # Anti-spam delay for Telegram
 
+    context.log(f"🏁 Execution finished. Total sent this hour: {success_count}")
     return context.res.json({"ok": True, "sent": success_count})
