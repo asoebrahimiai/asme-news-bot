@@ -319,7 +319,7 @@ def main(context):
             # No need to log skipped ones anymore, to keep logs clean
             continue
 
-        context.log(f"🔄 Processing potential news: {item['title'][:30]}...")
+        context.log(f"🔄 Processing potential news: {item['title'][:150]}...")
         text, image_url = extract_article_data(item['url'], context)
 
         if len(text) < 150:
