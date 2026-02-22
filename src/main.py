@@ -207,18 +207,25 @@ def summarize_with_groq(title: str, text: str, context) -> tuple[str, str]:
     if not GROQ_API_KEY:
         return title, "کلید GROQ_API_KEY تنظیم نشده است."
 
-    prompt = f"""You are a professional engineering news editor.
-    Task 1: Read the text below. Ignore ads.
-    Task 2: Translate the title to Persian.
-    Task 3: Summarize the MAIN story in Persian (2 paragraphs).
+    prompt = f"""You are a professional engineering news editor and an expert English-to-Persian translator.
+    Task 1: Read the text below. Ignore ads and irrelevant links.
+    Task 2: Translate the title to fluent Persian.
+    Task 3: Summarize the MAIN story in fluent, professional Persian (about 2 paragraphs).
+
+    CRITICAL RULES:
+    - The output MUST be 100% in pure Persian (Farsi) alphabet and language.
+    - ABSOLUTELY DO NOT include any Chinese, Japanese, Korean, or Cyrillic characters.
+    - Translate all English words (like 'knowledge', 'industry', etc.) to their Persian equivalents.
+    - Do not leave English words in the text unless it is a specific Brand Name (e.g., 'MIT', 'ASME').
+    - Write smoothly and naturally for an Iranian engineering audience.
 
     Source Title: {title}
     Source Text: {text[:3500]}
 
     Output JSON Format:
     {{
-      "title_fa": "Persian Title",
-      "summary_fa": "Persian Summary"
+      "title_fa": "Persian Title Here",
+      "summary_fa": "Persian Summary Here"
     }}"""
 
     url = "https://api.groq.com/openai/v1/chat/completions"
@@ -230,10 +237,10 @@ def summarize_with_groq(title: str, text: str, context) -> tuple[str, str]:
     payload = {
         "model": "llama-3.3-70b-versatile",
         "messages": [
-            {"role": "system", "content": "You are a JSON-only response bot. You output only valid JSON."},
+            {"role": "system", "content": "You are a JSON-only response bot. You output strictly valid JSON in pure Persian language without any foreign characters."},
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.2,
+        "temperature": 0.25, # Slightly increased to give it more flexibility in finding Persian words
         "response_format": {"type": "json_object"}
     }
 
@@ -248,7 +255,6 @@ def summarize_with_groq(title: str, text: str, context) -> tuple[str, str]:
             return title, f"خطای Groq (کد {resp.status_code})"
     except Exception:
         return title, "خطا در ارتباط با سرور هوش مصنوعی."
-
 # ─── ✈️ Telegram Sender ───────────────────────────────
 def send_telegram(title_fa: str, summary_fa: str, source: str, url: str, image_url: str, context) -> bool:
     safe_title = full_escape_markdown_v2(title_fa)
