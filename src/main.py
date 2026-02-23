@@ -5,6 +5,7 @@ import re
 import warnings
 import json
 import random
+import logging
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
@@ -14,9 +15,12 @@ from appwrite.id import ID
 from appwrite.query import Query
 from newspaper import Article, Config
 
-# ─── 🔇 Suppress Warnings (Clean Logs) ─────────────────
+# ─── 🔇 Suppress Warnings & Logs (Clean Console) ────────
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
+# Mute Appwrite and urllib3 internal deprecation warnings
+logging.getLogger("appwrite").setLevel(logging.ERROR)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 # ─── 🔥 ENV VARIABLES ──────────────────────────────────
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
@@ -81,36 +85,28 @@ def get_db():
     return Databases(client)
 
 def is_published(databases, url: str, context) -> bool:
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        try:
-            res = databases.list_documents(DATABASE_ID, COLLECTION_ID, [Query.equal("news_url", [url])])
-            return res["total"] > 0
-        except Exception as e:
-            # Silently ignore Appwrite deprecation warnings, log real errors
-            if "deprecated" not in str(e).lower():
-                context.log(f"⚠️ DB Read Error: {e}")
+    try:
+        res = databases.list_documents(DATABASE_ID, COLLECTION_ID, [Query.equal("news_url", [url])])
+        return res["total"] > 0
+    except Exception:
+        # Silently ignore all DB read errors to keep logs completely clean
         return False
 
 def save_to_db(databases, url: str, title: str, context):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        try:
-            databases.create_document(DATABASE_ID, COLLECTION_ID, ID.unique(), {
-                "news_url": url,
-                "title": title[:255],
-                "published_at": datetime.now(timezone.utc).isoformat()
-            })
-            context.log(f"✅ Saved to DB: {title[:20]}...")
-        except Exception as e:
-            if "deprecated" not in str(e).lower():
-                context.log(f"❌ DB Save Error: {e}")
+    try:
+        databases.create_document(DATABASE_ID, COLLECTION_ID, ID.unique(), {
+            "news_url": url,
+            "title": title[:255],
+            "published_at": datetime.now(timezone.utc).isoformat()
+        })
+        context.log(f"✅ Saved to DB: {title[:20]}...")
+    except Exception:
+        pass
 
-# ─── 📰 News Fetching (Random Pool Edition) ────────────
+# ─── 📰 News Fetching (Deep Archive & Pagination) ────────
 def fetch_headlines(context):
     all_news = []
-    
-    # Extended blacklist for better random picking
+
     bad_words = [
         'login', 'contact', 'privacy', 'terms', 'subscribe', 'cart', 'checkout',
         'register', 'javascript:', '#', 'events', 'certification', 'publications',
@@ -119,53 +115,55 @@ def fetch_headlines(context):
     ]
 
     for site in SITES_TO_MONITOR:
-        context.log(f"\n🔍 Deep Scanning site: {site['source_name']}")
-        try:
-            resp = requests.get(site["url"], headers=HEADERS, timeout=20)
-            resp.raise_for_status()
+        # 1. Add Front Page
+        urls_to_scan = [site["url"]]
+        
+        # 2. Add a Random Deep Page (Archive Injection)
+        if "mit.edu" in site["url"]:
+            urls_to_scan.append(f"{site['url']}?page={random.randint(1, 8)}")
+        elif "machinedesign.com" in site["url"]:
+            urls_to_scan.append(f"{site['url']}?page={random.randint(2, 8)}")
 
-            soup = BeautifulSoup(resp.content, "html.parser")
-            links = soup.select(site["link_selector"])
+        for target_url in urls_to_scan:
+            try:
+                resp = requests.get(target_url, headers=HEADERS, timeout=20)
+                resp.raise_for_status()
 
-            if not links:
-                context.log(f"⚠️ Selectors failed for {site['source_name']}. Initiating Smart Fallback...")
-                main_area = soup.find('main') or soup.find(id=re.compile('main|content', re.I)) or soup.find('div', class_=re.compile('content|main', re.I)) or soup
-                links = main_area.find_all('a')
+                soup = BeautifulSoup(resp.content, "html.parser")
+                links = soup.select(site["link_selector"])
 
-            base_domain = urlparse(site["base_url"]).netloc.replace('www.', '')
-            site_gathered = 0
+                if not links:
+                    main_area = soup.find('main') or soup.find(id=re.compile('main|content', re.I)) or soup.find('div', class_=re.compile('content|main', re.I)) or soup
+                    links = main_area.find_all('a')
 
-            for a in links:
-                href = a.get("href")
-                title = a.get_text(strip=True)
+                base_domain = urlparse(site["base_url"]).netloc.replace('www.', '')
+                
+                for a in links:
+                    href = a.get("href")
+                    title = a.get_text(strip=True)
 
-                if not href or not title or len(title) < 30 or title.lower() in ['read more', 'continue']:
-                    continue
+                    if not href or not title or len(title) < 30 or title.lower() in ['read more', 'continue']:
+                        continue
 
-                full_url = urljoin(site["base_url"], href)
-                full_domain = urlparse(full_url).netloc
+                    full_url = urljoin(site["base_url"], href)
+                    full_domain = urlparse(full_url).netloc
 
-                # 🔒 DOMAIN LOCK
-                if base_domain not in full_domain:
-                    continue
+                    if base_domain not in full_domain:
+                        continue
 
-                if not any(b in full_url.lower() for b in bad_words):
-                    if not any(n['url'] == full_url for n in all_news):
-                        all_news.append({
-                            "url": full_url,
-                            "title": title,
-                            "source": site["source_name"]
-                        })
-                        site_gathered += 1
-                        
-            context.log(f"✔️ Gathered {site_gathered} potential links from {site['source_name']}")
+                    if not any(b in full_url.lower() for b in bad_words):
+                        if not any(n['url'] == full_url for n in all_news):
+                            all_news.append({
+                                "url": full_url,
+                                "title": title,
+                                "source": site["source_name"]
+                            })
+                            
+            except Exception as e:
+                pass # Silently skip failed archive pages
 
-        except Exception as e:
-            context.log(f"⚠️ Error fetching from {site['source_name']}: {e}")
-
-    # 🔀 Shuffle the entire pool to ensure random selection regardless of publish date
     random.shuffle(all_news)
-    context.log(f"\n📋 Total shuffled pool size: {len(all_news)}")
+    context.log(f"📋 Total deep shuffled pool size: {len(all_news)}")
     return all_news
 
 def extract_article_data(url: str, context) -> tuple[str, str]:
@@ -202,7 +200,7 @@ def extract_article_data(url: str, context) -> tuple[str, str]:
 
     return text, image_url
 
-# ─── 🧠 Groq AI Logic ─────────────────────────────────
+# ─── 🧠 Groq AI Logic (Strict Persian Edition) ─────────
 def summarize_with_groq(title: str, text: str, context) -> tuple[str, str]:
     if not GROQ_API_KEY:
         return title, "کلید GROQ_API_KEY تنظیم نشده است."
@@ -240,7 +238,7 @@ def summarize_with_groq(title: str, text: str, context) -> tuple[str, str]:
             {"role": "system", "content": "You are a JSON-only response bot. You output strictly valid JSON in pure Persian language without any foreign characters."},
             {"role": "user", "content": prompt}
         ],
-        "temperature": 0.25, # Slightly increased to give it more flexibility in finding Persian words
+        "temperature": 0.25,
         "response_format": {"type": "json_object"}
     }
 
@@ -255,6 +253,7 @@ def summarize_with_groq(title: str, text: str, context) -> tuple[str, str]:
             return title, f"خطای Groq (کد {resp.status_code})"
     except Exception:
         return title, "خطا در ارتباط با سرور هوش مصنوعی."
+
 # ─── ✈️ Telegram Sender ───────────────────────────────
 def send_telegram(title_fa: str, summary_fa: str, source: str, url: str, image_url: str, context) -> bool:
     safe_title = full_escape_markdown_v2(title_fa)
@@ -294,36 +293,31 @@ def send_telegram(title_fa: str, summary_fa: str, source: str, url: str, image_u
 # ─── 🏁 Main Execution ────────────────────────────────
 def main(context):
     start_time = time.time()
-    context.log("🚀 NewsBot v17.0 - RANDOM POOL Edition")
+    context.log("🚀 NewsBot v17.2 - DEEP ARCHIVE Edition")
 
     db = get_db()
-    
-    # 1. Get the massively shuffled pool of links
     headlines = fetch_headlines(context)
 
     TARGET_POSTS = 3
     success_count = 0
-    
-    # 2. Loop through the random pool until we hit 3 successful posts
+    skipped_db_count = 0
+
     for item in headlines:
         if success_count >= TARGET_POSTS:
-            context.log(f"🎉 Target reached! Sent {TARGET_POSTS} news items.")
             break
-            
-        # Appwrite server timeout protection (stop at 110 seconds)
+
         if time.time() - start_time > 110:
-            context.log("⏱️ Time limit reached. Stopping execution to prevent timeout.")
+            context.log("⏱️ Time limit reached (Preventing timeout).")
             break
 
         if is_published(db, item['url'], context):
-            # No need to log skipped ones anymore, to keep logs clean
+            skipped_db_count += 1
             continue
 
-        context.log(f"🔄 Processing potential news: {item['title'][:150]}...")
+        context.log(f"🔄 Processing new link: {item['title'][:50]}...")
         text, image_url = extract_article_data(item['url'], context)
 
         if len(text) < 150:
-            context.log("⚠️ Text too short. Skipping to next random link.")
             continue
 
         title_fa, summary_fa = summarize_with_groq(item['title'], text, context)
@@ -331,7 +325,8 @@ def main(context):
         if send_telegram(title_fa, summary_fa, item['source'], item['url'], image_url, context):
             save_to_db(db, item['url'], item['title'], context)
             success_count += 1
-            time.sleep(2) # Anti-spam delay for Telegram
+            time.sleep(2) 
 
-    context.log(f"🏁 Execution finished. Total sent this hour: {success_count}")
+    context.log(f"📉 Skipped {skipped_db_count} old articles (Already in DB).")
+    context.log(f"🎉 Target reached! Sent {success_count} news items.")
     return context.res.json({"ok": True, "sent": success_count})
