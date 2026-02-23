@@ -1,4 +1,5 @@
 import os
+import sys
 import requests
 import time
 import re
@@ -15,8 +16,9 @@ from appwrite.id import ID
 from appwrite.query import Query
 from newspaper import Article, Config
 
-# ─── 🔇 Suppress Warnings & Logs (Clean Console) ────────
-warnings.filterwarnings("ignore")
+# ─── 🔇 Suppress Warnings (Kill Native Logs) ───────────
+if not sys.warnoptions:
+    warnings.simplefilter("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 logging.getLogger("appwrite").setLevel(logging.ERROR)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
@@ -40,31 +42,31 @@ HEADERS = {
     'Cache-Control': 'max-age=0',
 }
 
-# ─── 🌐 SITES TO MONITOR ───────────────────────────────
+# ─── 🌐 SITES TO MONITOR (Broadened Selectors) ─────────
 SITES_TO_MONITOR = [
     {
         "source_name": "ASME",
         "url": "https://www.asme.org/about-asme/media-inquiries/asme-in-the-headlines",
         "base_url": "https://www.asme.org",
-        "link_selector": ".headline-list a, article a, div.sf_colsIn a"
+        "link_selector": "h1 a, h2 a, h3 a, h4 a, .headline-list a, article a, div.sf_colsIn a"
     },
     {
         "source_name": "MIT_MechE",
         "url": "https://news.mit.edu/topic/mechanical-engineering",
         "base_url": "https://news.mit.edu",
-        "link_selector": ".term-page--news-article--item--title--link, h3.title a, h3 a"
+        "link_selector": "h1 a, h2 a, h3 a, h4 a, .term-page--news-article--item--title--link, article a"
     },
     {
         "source_name": "MachineDesign_Materials",
         "url": "https://www.machinedesign.com/materials",
         "base_url": "https://www.machinedesign.com",
-        "link_selector": ".article-teaser a, .teaser-title a, h2.title a, h3 a"
+        "link_selector": "h1 a, h2 a, h3 a, h4 a, .article-teaser a, .teaser-title a, article a"
     },
     {
         "source_name": "MachineDesign_Motion",
         "url": "https://www.machinedesign.com/mechanical-motion-systems",
         "base_url": "https://www.machinedesign.com",
-        "link_selector": ".article-teaser a, .teaser-title a, h2.title a, h3 a"
+        "link_selector": "h1 a, h2 a, h3 a, h4 a, .article-teaser a, .teaser-title a, article a"
     }
 ]
 
@@ -85,26 +87,29 @@ def get_db():
 
 def is_published(databases, url: str, context) -> bool:
     try:
-        res = databases.list_documents(DATABASE_ID, COLLECTION_ID, [Query.equal("news_url", [url])])
-        return res["total"] > 0
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            res = databases.list_documents(DATABASE_ID, COLLECTION_ID, [Query.equal("news_url", [url])])
+            return res["total"] > 0
     except Exception:
         return False
 
 def save_to_db(databases, url: str, title: str, context):
     try:
-        databases.create_document(DATABASE_ID, COLLECTION_ID, ID.unique(), {
-            "news_url": url,
-            "title": title[:255],
-            "published_at": datetime.now(timezone.utc).isoformat()
-        })
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            databases.create_document(DATABASE_ID, COLLECTION_ID, ID.unique(), {
+                "news_url": url,
+                "title": title[:255],
+                "published_at": datetime.now(timezone.utc).isoformat()
+            })
     except Exception:
         pass
 
-# ─── 📰 News Fetching (Balanced Round-Robin Edition) ───
-def fetch_headlines(context):
-    # Create separate pools for each site to ensure fairness
+# ─── 📰 News Fetching (Isolated Source Pools) ──────────
+def fetch_headlines_by_source(context):
     site_pools = {site["source_name"]: [] for site in SITES_TO_MONITOR}
-
+    
     bad_words = [
         'login', 'contact', 'privacy', 'terms', 'subscribe', 'cart', 'checkout',
         'register', 'javascript:', '#', 'events', 'certification', 'publications',
@@ -115,7 +120,6 @@ def fetch_headlines(context):
     for site in SITES_TO_MONITOR:
         urls_to_scan = [site["url"]]
         
-        # Deep Archive Injection
         if "mit.edu" in site["url"]:
             urls_to_scan.append(f"{site['url']}?page={random.randint(1, 8)}")
         elif "machinedesign.com" in site["url"]:
@@ -124,7 +128,7 @@ def fetch_headlines(context):
         for target_url in urls_to_scan:
             try:
                 resp = requests.get(target_url, headers=HEADERS, timeout=20)
-                resp.raise_for_status()
+                if resp.status_code != 200: continue
 
                 soup = BeautifulSoup(resp.content, "html.parser")
                 links = soup.select(site["link_selector"])
@@ -149,35 +153,20 @@ def fetch_headlines(context):
                         continue
 
                     if not any(b in full_url.lower() for b in bad_words):
-                        # Ensure no duplicates inside the specific site pool
                         if not any(n['url'] == full_url for n in site_pools[site["source_name"]]):
                             site_pools[site["source_name"]].append({
                                 "url": full_url,
                                 "title": title,
                                 "source": site["source_name"]
                             })
-                            
             except Exception:
                 pass 
 
-    # 🔀 Balance and Interleave the pools (Round-Robin)
-    balanced_news = []
-    
-    # 1. Shuffle links within each individual site's pool
     for source in site_pools:
         random.shuffle(site_pools[source])
-        context.log(f"📊 {source} provided {len(site_pools[source])} links.")
+        context.log(f"📊 {source} pooled {len(site_pools[source])} links.")
 
-    # 2. Pick one by one from each site to guarantee site diversity
-    while any(site_pools.values()):
-        sources = list(site_pools.keys())
-        random.shuffle(sources) # Randomize which site goes first in each round
-        for source in sources:
-            if site_pools[source]:
-                balanced_news.append(site_pools[source].pop(0))
-
-    context.log(f"⚖️ Final balanced pool size: {len(balanced_news)}")
-    return balanced_news
+    return site_pools
 
 def extract_article_data(url: str, context) -> tuple[str, str]:
     text = ""
@@ -213,7 +202,7 @@ def extract_article_data(url: str, context) -> tuple[str, str]:
 
     return text, image_url
 
-# ─── 🧠 Groq AI Logic (Strict Persian Edition) ─────────
+# ─── 🧠 Groq AI Logic ─────────────────────────────────
 def summarize_with_groq(title: str, text: str, context) -> tuple[str, str]:
     if not GROQ_API_KEY:
         return title, "کلید GROQ_API_KEY تنظیم نشده است."
@@ -307,40 +296,62 @@ def send_telegram(title_fa: str, summary_fa: str, source: str, url: str, image_u
 # ─── 🏁 Main Execution ────────────────────────────────
 def main(context):
     start_time = time.time()
-    context.log("🚀 NewsBot v17.3 - BALANCED ROUND-ROBIN Edition")
+    context.log("🚀 NewsBot v17.4 - STRICT SOURCE ALLOCATION")
 
     db = get_db()
-    headlines = fetch_headlines(context)
+    headlines_by_source = fetch_headlines_by_source(context)
 
     TARGET_POSTS = 3
     success_count = 0
-    skipped_db_count = 0
+    
+    # List of sources that still have unchecked links
+    active_sources = list(headlines_by_source.keys())
 
-    for item in headlines:
-        if success_count >= TARGET_POSTS:
+    # Strict Allocation Loop
+    while success_count < TARGET_POSTS and active_sources:
+        random.shuffle(active_sources) # Give random source priority each round
+        progress_made_in_round = False
+
+        for source in list(active_sources):
+            if success_count >= TARGET_POSTS:
+                break
+            
+            if time.time() - start_time > 110:
+                context.log("⏱️ Timeout protection triggered.")
+                return context.res.json({"ok": True, "sent": success_count})
+
+            # Keep popping from THIS specific source until we find 1 good, unpublished article
+            while headlines_by_source[source]:
+                item = headlines_by_source[source].pop(0)
+
+                # Skip if old
+                if is_published(db, item['url'], context):
+                    continue
+
+                # Check text length
+                text, image_url = extract_article_data(item['url'], context)
+                if len(text) < 150:
+                    continue
+
+                # WE FOUND ONE! Process it and break to give the NEXT source a turn
+                context.log(f"🔄 Processing [{source}]: {item['title'][:40]}...")
+                title_fa, summary_fa = summarize_with_groq(item['title'], text, context)
+
+                if send_telegram(title_fa, summary_fa, item['source'], item['url'], image_url, context):
+                    save_to_db(db, item['url'], item['title'], context)
+                    success_count += 1
+                    progress_made_in_round = True
+                    time.sleep(2) 
+                    break # Break the inner while-loop, move to the next site
+
+            # If the while-loop emptied this site's pool completely, remove it from active rotation
+            if not headlines_by_source[source]:
+                active_sources.remove(source)
+
+        # If we went through all sites and none of them had a valid new post, we must stop
+        if not progress_made_in_round:
+            context.log("⚠️ No new unread articles found across any active source.")
             break
 
-        if time.time() - start_time > 110:
-            context.log("⏱️ Time limit reached (Preventing timeout).")
-            break
-
-        if is_published(db, item['url'], context):
-            skipped_db_count += 1
-            continue
-
-        context.log(f"🔄 Processing [{item['source']}]: {item['title'][:40]}...")
-        text, image_url = extract_article_data(item['url'], context)
-
-        if len(text) < 150:
-            continue
-
-        title_fa, summary_fa = summarize_with_groq(item['title'], text, context)
-
-        if send_telegram(title_fa, summary_fa, item['source'], item['url'], image_url, context):
-            save_to_db(db, item['url'], item['title'], context)
-            success_count += 1
-            time.sleep(2) 
-
-    context.log(f"📉 Skipped {skipped_db_count} old articles (Already in DB).")
     context.log(f"🎉 Target reached! Sent {success_count} news items.")
     return context.res.json({"ok": True, "sent": success_count})
