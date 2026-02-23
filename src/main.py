@@ -18,7 +18,6 @@ from newspaper import Article, Config
 # ─── 🔇 Suppress Warnings & Logs (Clean Console) ────────
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
-# Mute Appwrite and urllib3 internal deprecation warnings
 logging.getLogger("appwrite").setLevel(logging.ERROR)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
 
@@ -89,7 +88,6 @@ def is_published(databases, url: str, context) -> bool:
         res = databases.list_documents(DATABASE_ID, COLLECTION_ID, [Query.equal("news_url", [url])])
         return res["total"] > 0
     except Exception:
-        # Silently ignore all DB read errors to keep logs completely clean
         return False
 
 def save_to_db(databases, url: str, title: str, context):
@@ -99,13 +97,13 @@ def save_to_db(databases, url: str, title: str, context):
             "title": title[:255],
             "published_at": datetime.now(timezone.utc).isoformat()
         })
-        context.log(f"✅ Saved to DB: {title[:20]}...")
     except Exception:
         pass
 
-# ─── 📰 News Fetching (Deep Archive & Pagination) ────────
+# ─── 📰 News Fetching (Balanced Round-Robin Edition) ───
 def fetch_headlines(context):
-    all_news = []
+    # Create separate pools for each site to ensure fairness
+    site_pools = {site["source_name"]: [] for site in SITES_TO_MONITOR}
 
     bad_words = [
         'login', 'contact', 'privacy', 'terms', 'subscribe', 'cart', 'checkout',
@@ -115,10 +113,9 @@ def fetch_headlines(context):
     ]
 
     for site in SITES_TO_MONITOR:
-        # 1. Add Front Page
         urls_to_scan = [site["url"]]
         
-        # 2. Add a Random Deep Page (Archive Injection)
+        # Deep Archive Injection
         if "mit.edu" in site["url"]:
             urls_to_scan.append(f"{site['url']}?page={random.randint(1, 8)}")
         elif "machinedesign.com" in site["url"]:
@@ -152,19 +149,35 @@ def fetch_headlines(context):
                         continue
 
                     if not any(b in full_url.lower() for b in bad_words):
-                        if not any(n['url'] == full_url for n in all_news):
-                            all_news.append({
+                        # Ensure no duplicates inside the specific site pool
+                        if not any(n['url'] == full_url for n in site_pools[site["source_name"]]):
+                            site_pools[site["source_name"]].append({
                                 "url": full_url,
                                 "title": title,
                                 "source": site["source_name"]
                             })
                             
-            except Exception as e:
-                pass # Silently skip failed archive pages
+            except Exception:
+                pass 
 
-    random.shuffle(all_news)
-    context.log(f"📋 Total deep shuffled pool size: {len(all_news)}")
-    return all_news
+    # 🔀 Balance and Interleave the pools (Round-Robin)
+    balanced_news = []
+    
+    # 1. Shuffle links within each individual site's pool
+    for source in site_pools:
+        random.shuffle(site_pools[source])
+        context.log(f"📊 {source} provided {len(site_pools[source])} links.")
+
+    # 2. Pick one by one from each site to guarantee site diversity
+    while any(site_pools.values()):
+        sources = list(site_pools.keys())
+        random.shuffle(sources) # Randomize which site goes first in each round
+        for source in sources:
+            if site_pools[source]:
+                balanced_news.append(site_pools[source].pop(0))
+
+    context.log(f"⚖️ Final balanced pool size: {len(balanced_news)}")
+    return balanced_news
 
 def extract_article_data(url: str, context) -> tuple[str, str]:
     text = ""
@@ -278,13 +291,14 @@ def send_telegram(title_fa: str, summary_fa: str, source: str, url: str, image_u
     try:
         resp = requests.post(api_url, json=payload, timeout=20)
         if resp.status_code == 200:
-            context.log("✅ Telegram sent.")
+            context.log(f"✅ Telegram sent: {source}")
             return True
         elif "sendPhoto" in api_url:
             payload.pop("photo", None)
             payload.pop("caption", None)
             payload["text"] = caption
             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=20)
+            context.log(f"✅ Telegram sent (Text Fallback): {source}")
             return True
     except Exception:
         pass
@@ -293,7 +307,7 @@ def send_telegram(title_fa: str, summary_fa: str, source: str, url: str, image_u
 # ─── 🏁 Main Execution ────────────────────────────────
 def main(context):
     start_time = time.time()
-    context.log("🚀 NewsBot v17.2 - DEEP ARCHIVE Edition")
+    context.log("🚀 NewsBot v17.3 - BALANCED ROUND-ROBIN Edition")
 
     db = get_db()
     headlines = fetch_headlines(context)
@@ -314,7 +328,7 @@ def main(context):
             skipped_db_count += 1
             continue
 
-        context.log(f"🔄 Processing new link: {item['title'][:50]}...")
+        context.log(f"🔄 Processing [{item['source']}]: {item['title'][:40]}...")
         text, image_url = extract_article_data(item['url'], context)
 
         if len(text) < 150:
