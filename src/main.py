@@ -1,27 +1,29 @@
 import os
 import sys
-import requests
-import time
-import re
-import warnings
-import json
-import random
 import logging
+import json
+import hashlib
+import feedparser
+import requests
+import warnings
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlparse
-from bs4 import BeautifulSoup
 from appwrite.client import Client
 from appwrite.services.databases import Databases
 from appwrite.id import ID
 from appwrite.query import Query
-from newspaper import Article, Config
 
-# ─── 🔇 Suppress Warnings (Kill Native Logs) ───────────
+# ─── 🔇 Suppress Warnings & Setup Logging ───────────────
 if not sys.warnoptions:
     warnings.simplefilter("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger(__name__)
 logging.getLogger("appwrite").setLevel(logging.ERROR)
-logging.getLogger("urllib3").setLevel(logging.ERROR)
 
 # ─── 🔥 ENV VARIABLES ──────────────────────────────────
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_TOKEN")
@@ -32,326 +34,185 @@ APPWRITE_API_KEY   = os.getenv("APPWRITE_API_KEY")
 DATABASE_ID        = os.getenv("APPWRITE_DATABASE_ID")
 COLLECTION_ID      = os.getenv("APPWRITE_COLLECTION_ID")
 GROQ_API_KEY       = os.getenv("GROQ_API_KEY")
+MAX_POSTS          = int(os.getenv("MAX_POSTS", "3"))
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9,fa;q=0.8',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-    'Cache-Control': 'max-age=0',
+# ─── 🌐 RSS SOURCES (منابع تخصصی و علمی) ───────────────
+RSS_SOURCES = {
+    "ScienceDaily_Materials": {
+        "url": "https://www.sciencedaily.com/rss/matter_energy/materials_science.xml",
+        "emoji": "🔬",
+        "category": "علم مواد"
+    },
+    "Phys_org_Tech": {
+        "url": "https://phys.org/rss-feed/technology-news/",
+        "emoji": "🔭",
+        "category": "فناوری"
+    },
+    "MIT_News_Engineering": {
+        "url": "https://news.mit.edu/rss/topic/engineering",
+        "emoji": "⚙️",
+        "category": "مهندسی MIT"
+    },
+    "TechXplore": {
+        "url": "https://techxplore.com/rss-feed/",
+        "emoji": "🤖",
+        "category": "فناوری پیشرفته"
+    }
 }
 
-# ─── 🌐 SITES TO MONITOR (Broadened Selectors) ─────────
-SITES_TO_MONITOR = [
-    {
-        "source_name": "ASME",
-        "url": "https://www.asme.org/about-asme/media-inquiries/asme-in-the-headlines",
-        "base_url": "https://www.asme.org",
-        "link_selector": "h1 a, h2 a, h3 a, h4 a, .headline-list a, article a, div.sf_colsIn a"
-    },
-    {
-        "source_name": "MIT_MechE",
-        "url": "https://news.mit.edu/topic/mechanical-engineering",
-        "base_url": "https://news.mit.edu",
-        "link_selector": "h1 a, h2 a, h3 a, h4 a, .term-page--news-article--item--title--link, article a"
-    },
-    {
-        "source_name": "MachineDesign_Materials",
-        "url": "https://www.machinedesign.com/materials",
-        "base_url": "https://www.machinedesign.com",
-        "link_selector": "h1 a, h2 a, h3 a, h4 a, .article-teaser a, .teaser-title a, article a"
-    },
-    {
-        "source_name": "MachineDesign_Motion",
-        "url": "https://www.machinedesign.com/mechanical-motion-systems",
-        "base_url": "https://www.machinedesign.com",
-        "link_selector": "h1 a, h2 a, h3 a, h4 a, .article-teaser a, .teaser-title a, article a"
-    }
-]
-
-# ─── 🛠 Helper Functions ──────────────────────────────
-def full_escape_markdown_v2(text: str) -> str:
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    text = re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
-    return text.strip()
-
-def url_safe_encode(url: str) -> str:
-    return requests.utils.quote(url, safe=':/?#[]@!$&\'()*+,;=')
-
-# ─── 💾 Appwrite DB ───────────────────────────────────
+# ─── 💾 Appwrite DB (جایگزین فایل tmp برای جلوگیری از تکرار) ───
 def get_db():
     client = Client()
     client.set_endpoint(APPWRITE_ENDPOINT).set_project(APPWRITE_PROJECT_ID).set_key(APPWRITE_API_KEY)
     return Databases(client)
 
-def is_published(databases, url: str, context) -> bool:
+def make_hash(url: str) -> str:
+    return hashlib.md5(url.encode()).hexdigest()[:15]
+
+def is_published(databases, url: str) -> bool:
     try:
+        url_hash = make_hash(url)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            res = databases.list_documents(DATABASE_ID, COLLECTION_ID, [Query.equal("news_url", [url])])
+            res = databases.list_documents(DATABASE_ID, COLLECTION_ID, [Query.equal("news_url", [url_hash])])
             return res["total"] > 0
     except Exception:
         return False
 
-def save_to_db(databases, url: str, title: str, context):
+def save_to_db(databases, url: str, title: str):
     try:
+        url_hash = make_hash(url)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             databases.create_document(DATABASE_ID, COLLECTION_ID, ID.unique(), {
-                "news_url": url,
+                "news_url": url_hash,
                 "title": title[:255],
                 "published_at": datetime.now(timezone.utc).isoformat()
             })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"DB Save Error: {e}")
 
-# ─── 📰 News Fetching (Isolated Source Pools) ──────────
-def fetch_headlines_by_source(context):
-    site_pools = {site["source_name"]: [] for site in SITES_TO_MONITOR}
-    
-    bad_words = [
-        'login', 'contact', 'privacy', 'terms', 'subscribe', 'cart', 'checkout',
-        'register', 'javascript:', '#', 'events', 'certification', 'publications',
-        'codes-standards', 'membership', 'about', 'author', 'category', 'webinar',
-        'whitepaper', 'directory', 'video', 'podcast', 'gallery', 'index'
-    ]
+# ─── 🧠 Groq AI Translator ─────────────────────────────
+def translate_and_summarize(title: str, text: str) -> tuple[str, str]:
+    if not GROQ_API_KEY: return title, text
 
-    for site in SITES_TO_MONITOR:
-        urls_to_scan = [site["url"]]
-        
-        if "mit.edu" in site["url"]:
-            urls_to_scan.append(f"{site['url']}?page={random.randint(1, 8)}")
-        elif "machinedesign.com" in site["url"]:
-            urls_to_scan.append(f"{site['url']}?page={random.randint(2, 8)}")
+    prompt = f"""You are an engineering news editor.
+    Translate the Title to fluent Persian.
+    Summarize the main story in pure, professional Persian (Farsi) in 1-2 paragraphs.
+    NO English words (except brand names), NO Chinese/Cyrillic characters.
 
-        for target_url in urls_to_scan:
-            try:
-                resp = requests.get(target_url, headers=HEADERS, timeout=20)
-                if resp.status_code != 200: continue
-
-                soup = BeautifulSoup(resp.content, "html.parser")
-                links = soup.select(site["link_selector"])
-
-                if not links:
-                    main_area = soup.find('main') or soup.find(id=re.compile('main|content', re.I)) or soup.find('div', class_=re.compile('content|main', re.I)) or soup
-                    links = main_area.find_all('a')
-
-                base_domain = urlparse(site["base_url"]).netloc.replace('www.', '')
-                
-                for a in links:
-                    href = a.get("href")
-                    title = a.get_text(strip=True)
-
-                    if not href or not title or len(title) < 30 or title.lower() in ['read more', 'continue']:
-                        continue
-
-                    full_url = urljoin(site["base_url"], href)
-                    full_domain = urlparse(full_url).netloc
-
-                    if base_domain not in full_domain:
-                        continue
-
-                    if not any(b in full_url.lower() for b in bad_words):
-                        if not any(n['url'] == full_url for n in site_pools[site["source_name"]]):
-                            site_pools[site["source_name"]].append({
-                                "url": full_url,
-                                "title": title,
-                                "source": site["source_name"]
-                            })
-            except Exception:
-                pass 
-
-    for source in site_pools:
-        random.shuffle(site_pools[source])
-        context.log(f"📊 {source} pooled {len(site_pools[source])} links.")
-
-    return site_pools
-
-def extract_article_data(url: str, context) -> tuple[str, str]:
-    text = ""
-    image_url = ""
-
-    try:
-        config = Config(fetch_images=True, browser_user_agent=HEADERS['User-Agent'], request_timeout=15)
-        article = Article(url, config=config)
-        article.download()
-        article.parse()
-        text = article.text.strip()
-        image_url = article.top_image
-    except Exception:
-        pass
-
-    if len(text) < 200:
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=15)
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.content, "html.parser")
-                for script in soup(["script", "style", "nav", "footer", "header", "aside"]):
-                    script.decompose()
-                article_body = soup.find('article') or soup.find('main') or soup.body
-                if article_body:
-                    paragraphs = article_body.find_all('p')
-                    clean_paragraphs = [p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 60]
-                    text = "\n".join(clean_paragraphs)
-                    if not image_url:
-                        og_image = soup.find("meta", property="og:image")
-                        if og_image: image_url = og_image.get("content", "")
-        except Exception:
-            pass
-
-    return text, image_url
-
-# ─── 🧠 Groq AI Logic ─────────────────────────────────
-def summarize_with_groq(title: str, text: str, context) -> tuple[str, str]:
-    if not GROQ_API_KEY:
-        return title, "کلید GROQ_API_KEY تنظیم نشده است."
-
-    prompt = f"""You are a professional engineering news editor and an expert English-to-Persian translator.
-    Task 1: Read the text below. Ignore ads and irrelevant links.
-    Task 2: Translate the title to fluent Persian.
-    Task 3: Summarize the MAIN story in fluent, professional Persian (about 2 paragraphs).
-
-    CRITICAL RULES:
-    - The output MUST be 100% in pure Persian (Farsi) alphabet and language.
-    - ABSOLUTELY DO NOT include any Chinese, Japanese, Korean, or Cyrillic characters.
-    - Translate all English words (like 'knowledge', 'industry', etc.) to their Persian equivalents.
-    - Do not leave English words in the text unless it is a specific Brand Name (e.g., 'MIT', 'ASME').
-    - Write smoothly and naturally for an Iranian engineering audience.
-
-    Source Title: {title}
-    Source Text: {text[:3500]}
+    Title: {title}
+    Text: {text[:3000]}
 
     Output JSON Format:
     {{
-      "title_fa": "Persian Title Here",
-      "summary_fa": "Persian Summary Here"
+      "title_fa": "Persian Title",
+      "summary_fa": "Persian Summary"
     }}"""
 
     url = "https://api.groq.com/openai/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": "llama-3.3-70b-versatile",
-        "messages": [
-            {"role": "system", "content": "You are a JSON-only response bot. You output strictly valid JSON in pure Persian language without any foreign characters."},
-            {"role": "user", "content": prompt}
-        ],
+        "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.25,
         "response_format": {"type": "json_object"}
     }
 
     try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
+        resp = requests.post(url, headers=headers, json=payload, timeout=20)
         if resp.status_code == 200:
-            data = resp.json()
-            content_str = data['choices'][0]['message']['content']
-            parsed = json.loads(content_str)
-            return parsed.get("title_fa", title), parsed.get("summary_fa", "خلاصه تولید نشد.")
-        else:
-            return title, f"خطای Groq (کد {resp.status_code})"
-    except Exception:
-        return title, "خطا در ارتباط با سرور هوش مصنوعی."
-
-# ─── ✈️ Telegram Sender ───────────────────────────────
-def send_telegram(title_fa: str, summary_fa: str, source: str, url: str, image_url: str, context) -> bool:
-    safe_title = full_escape_markdown_v2(title_fa)
-    safe_source = full_escape_markdown_v2(source)
-    safe_url = url_safe_encode(url)
-
-    if len(summary_fa) > 850: summary_fa = summary_fa[:850] + "..."
-    safe_summary = full_escape_markdown_v2(summary_fa)
-
-    caption = f"*{safe_title}*\n\n{safe_summary}\n\n🌐 منبع: {safe_source}\n🔗 [مشاهده کامل]({safe_url})"
-
-    api_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto" if image_url and image_url.startswith('http') else f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHANNEL, "parse_mode": "MarkdownV2"}
-
-    if "sendPhoto" in api_url:
-        payload["photo"] = image_url
-        payload["caption"] = caption
-    else:
-        payload["text"] = caption
-        payload["disable_web_page_preview"] = False
-
-    try:
-        resp = requests.post(api_url, json=payload, timeout=20)
-        if resp.status_code == 200:
-            context.log(f"✅ Telegram sent: {source}")
-            return True
-        elif "sendPhoto" in api_url:
-            payload.pop("photo", None)
-            payload.pop("caption", None)
-            payload["text"] = caption
-            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json=payload, timeout=20)
-            context.log(f"✅ Telegram sent (Text Fallback): {source}")
-            return True
+            data = json.loads(resp.json()['choices'][0]['message']['content'])
+            return data.get("title_fa", title), data.get("summary_fa", text)
     except Exception:
         pass
-    return False
+    return title, text
 
-# ─── 🏁 Main Execution ────────────────────────────────
-def main(context):
-    start_time = time.time()
-    context.log("🚀 NewsBot v17.4 - STRICT SOURCE ALLOCATION")
-
-    db = get_db()
-    headlines_by_source = fetch_headlines_by_source(context)
-
-    TARGET_POSTS = 3
-    success_count = 0
+# ─── ✈️ Telegram Sender ───────────────────────────────
+def send_to_telegram(source_cfg: dict, title_fa: str, summary_fa: str, link: str) -> bool:
+    emoji = source_cfg["emoji"]
+    category = source_cfg["category"]
     
-    # List of sources that still have unchecked links
-    active_sources = list(headlines_by_source.keys())
+    # Cleaning markdown breaking characters for safe Markdown mode
+    safe_title = title_fa.replace('*', '').replace('_', '').replace('`', '')
+    safe_summary = summary_fa.replace('*', '').replace('_', '').replace('`', '')
 
-    # Strict Allocation Loop
-    while success_count < TARGET_POSTS and active_sources:
-        random.shuffle(active_sources) # Give random source priority each round
-        progress_made_in_round = False
+    msg = f"{emoji} *{safe_title}*\n\n🏷 {category}\n\n📄 {safe_summary}\n\n🔗 [مطالعه کامل]({link})"
 
-        for source in list(active_sources):
-            if success_count >= TARGET_POSTS:
-                break
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHANNEL,
+        "text": msg,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": False,
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=20)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+# ─── 🏁 Main Logic ────────────────────────────────────
+def main(context):
+    logger.info("🚀 NewsBot v18.0 (Hybrid RSS + Appwrite DB + Groq AI)")
+    
+    db = get_db()
+    pools = {}
+
+    # 1. Fetch from RSS Feeds
+    for source_name, source_cfg in RSS_SOURCES.items():
+        try:
+            resp = requests.get(source_cfg["url"], timeout=15)
+            feed = feedparser.parse(resp.content)
+            entries = feed.get("entries", [])
             
-            if time.time() - start_time > 110:
-                context.log("⏱️ Timeout protection triggered.")
-                return context.res.json({"ok": True, "sent": success_count})
+            # Filter unread items strictly using Appwrite DB
+            new_entries = []
+            for e in entries:
+                link = e.get("link", "")
+                if link and not is_published(db, link):
+                    new_entries.append(e)
+            
+            pools[source_name] = new_entries
+            logger.info(f"📊 {source_name}: {len(entries)} total | {len(new_entries)} unread")
+        except Exception as e:
+            logger.error(f"❌ Failed to fetch {source_name}: {e}")
 
-            # Keep popping from THIS specific source until we find 1 good, unpublished article
-            while headlines_by_source[source]:
-                item = headlines_by_source[source].pop(0)
+    # 2. Round-Robin Fair Selection
+    active_sources = {k: list(v) for k, v in pools.items() if v}
+    selected_items = []
+    
+    if active_sources:
+        source_names = list(active_sources.keys())
+        idx = 0
+        while len(selected_items) < MAX_POSTS and any(active_sources.values()):
+            source = source_names[idx % len(source_names)]
+            if active_sources[source]:
+                selected_items.append((source, active_sources[source].pop(0)))
+            idx += 1
 
-                # Skip if old
-                if is_published(db, item['url'], context):
-                    continue
+    logger.info(f"🎯 Selected {len(selected_items)} items via Round-Robin")
+    
+    # 3. Process, Translate, and Send
+    success_count = 0
+    import time
+    
+    for source_name, entry in selected_items:
+        source_cfg = RSS_SOURCES[source_name]
+        raw_title = entry.get("title", "")
+        raw_summary = entry.get("summary", "")
+        link = entry.get("link", "")
 
-                # Check text length
-                text, image_url = extract_article_data(item['url'], context)
-                if len(text) < 150:
-                    continue
+        import re
+        raw_summary = re.sub(r"<[^>]+>", "", raw_summary).strip()
+        
+        logger.info(f"🤖 Translating [{source_name}]: {raw_title[:40]}...")
+        title_fa, summary_fa = translate_and_summarize(raw_title, raw_summary)
 
-                # WE FOUND ONE! Process it and break to give the NEXT source a turn
-                context.log(f"🔄 Processing [{source}]: {item['title'][:40]}...")
-                title_fa, summary_fa = summarize_with_groq(item['title'], text, context)
+        if send_to_telegram(source_cfg, title_fa, summary_fa, link):
+            save_to_db(db, link, raw_title)
+            success_count += 1
+            logger.info(f"✅ Posted & Saved successfully.")
+            time.sleep(2)
 
-                if send_telegram(title_fa, summary_fa, item['source'], item['url'], image_url, context):
-                    save_to_db(db, item['url'], item['title'], context)
-                    success_count += 1
-                    progress_made_in_round = True
-                    time.sleep(2) 
-                    break # Break the inner while-loop, move to the next site
-
-            # If the while-loop emptied this site's pool completely, remove it from active rotation
-            if not headlines_by_source[source]:
-                active_sources.remove(source)
-
-        # If we went through all sites and none of them had a valid new post, we must stop
-        if not progress_made_in_round:
-            context.log("⚠️ No new unread articles found across any active source.")
-            break
-
-    context.log(f"🎉 Target reached! Sent {success_count} news items.")
-    return context.res.json({"ok": True, "sent": success_count})
+    return context.res.json({"ok": True, "posted": success_count})
